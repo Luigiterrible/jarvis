@@ -872,21 +872,46 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
-    // Full detail for a single async task. The list payloads cap the
-    // result response at LIST_RESPONSE_MAX_CHARS; this returns it whole
-    // (the UI fetches it on expand when `response_truncated` is set).
+    // Full detail for a single async task. Returns the response whole (the
+    // agents room fetches it on expand when `response_truncated` is set) and
+    // also flattens the fields the sub-pebble's "open full" panel
+    // (taskResult room) renders directly.
     '/api/agents/tasks/:id': {
       GET: (req: Request & { params: { id: string } }) => {
         const tm = ctx.agentService.getTaskManager();
         if (!tm) return error('Persistent agents are not available.', 503);
         const task = tm.getTask(req.params.id);
         if (!task) return error(`Task "${req.params.id}" not found.`, 404);
+        const elapsedS = Math.round(((task.completedAt ?? Date.now()) - task.startedAt) / 1000);
         return json({
           ...taskToJSON(task, { full: true }),
           agent_id: task.agentId,
           agent_name: task.agentName,
           specialist_id: task.specialistId,
+          // Flat fields consumed by the taskResult room panel.
+          specialist: task.specialistId,
+          elapsed_seconds: elapsedS,
+          response: task.result?.response ?? '',
+          summary: task.summary,
+          tools_used: task.result?.toolsUsed ?? [],
+          tokens_used: task.result?.tokensUsed ?? null,
         });
+      },
+    },
+
+    // Pebble long-answer panel — when a JARVIS response overflows the
+    // speaking bubble, the daemon registers it in the answer store and
+    // the sidecar shows an "open full ↗" button. Click spawns a panel
+    // at `#/_answer_<id>` which fetches from this endpoint.
+    '/api/pebble/answers/:id': {
+      GET: async (req: Request) => {
+        const { pebbleAnswerStore } = await import('./answer-store.ts');
+        const url = new URL(req.url);
+        const id = decodeURIComponent(url.pathname.split('/').pop() ?? '');
+        if (!id) return error('Missing answer id', 400);
+        const record = pebbleAnswerStore.get(id);
+        if (!record) return error(`Answer ${id} not found`, 404);
+        return json(record);
       },
     },
 
@@ -2378,6 +2403,47 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           };
         });
         return json(tools);
+      },
+    },
+
+    /**
+     * W4 — palette panel picks. The dashboard's `_palette` panel-mode
+     * page POSTs here when the user picks a Room or hits Esc; the daemon
+     * forwards the call through the registered palette handler so the
+     * room-spawn / panel-close logic stays in `index.ts` where the panel
+     * tracking lives. 204 on success, 503 if no handler registered.
+     */
+    '/api/palette/pick': {
+      POST: async (req: Request) => {
+        const { getPaletteHandler } = await import('./palette-controller.ts');
+        const h = getPaletteHandler();
+        if (!h) return error('Palette handler not registered', 503);
+        const body = (await req.json().catch(() => null)) as
+          | { kind?: string; key?: string; openInRoom?: boolean }
+          | null;
+        if (!body || (body.kind !== 'room' && body.kind !== 'object') || !body.key) {
+          return error('kind ("room"|"object") and key are required', 400);
+        }
+        try {
+          await h.pick({ kind: body.kind, key: body.key, openInRoom: !!body.openInRoom });
+        } catch (err) {
+          return error(`pick failed: ${(err as Error).message}`, 500);
+        }
+        return new Response(null, { status: 204 });
+      },
+    },
+
+    '/api/palette/close': {
+      POST: async () => {
+        const { getPaletteHandler } = await import('./palette-controller.ts');
+        const h = getPaletteHandler();
+        if (!h) return error('Palette handler not registered', 503);
+        try {
+          await h.close();
+        } catch (err) {
+          return error(`close failed: ${(err as Error).message}`, 500);
+        }
+        return new Response(null, { status: 204 });
       },
     },
 

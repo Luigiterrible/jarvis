@@ -223,22 +223,62 @@ export class WebSocketServer {
           return new Response('WebSocket upgrade failed', { status: 500 });
         }
 
+        // 0b. Sidecar access-token mint. Authenticated by the long-lived
+        //     enrollment JWT (Authorization: Bearer) — this and /sidecar/connect
+        //     are the ONLY places that credential is accepted. Returns a
+        //     short-lived access token the sidecar injects into its panel
+        //     webviews; everything on the data plane (/api, /ws) authenticates
+        //     with that access token, never the enrollment JWT.
+        if (pathname === '/sidecar/token' && req.method === 'POST' && self.sidecarManager) {
+          const authHeader = req.headers.get('Authorization');
+          const enrollTok = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+          const claims = enrollTok ? await self.sidecarManager.validateToken(enrollTok) : null;
+          if (!claims?.sid) {
+            return new Response('Invalid or revoked token', { status: 403 });
+          }
+          const minted = await self.sidecarManager.issueAccessToken(claims.sid);
+          if (!minted) {
+            return Response.json({ error: 'mint failed' }, { status: 500 });
+          }
+          return Response.json({ access_token: minted.token, expires_in: minted.expiresIn });
+        }
+
         // 1. Auth check (if configured)
         if (self.authToken && !isPublicRoute(pathname, req.method)) {
+          // A request is authorized by EITHER the dashboard token OR a valid
+          // short-lived sidecar ACCESS token. The sidecar's panel webviews carry
+          // an access token (minted from the enrollment JWT via /sidecar/token)
+          // so their content fetches authenticate without the dashboard token.
+          // The long-lived enrollment JWT is deliberately NOT accepted here —
+          // only on /sidecar/connect and the mint endpoint — so a leaked panel
+          // credential is bounded to the access-token TTL instead of forever.
+          const accepts = async (tok: string | null): Promise<boolean> => {
+            if (!tok) return false;
+            if (safeCompare(tok, self.authToken!)) return true;
+            if (self.sidecarManager && (await self.sidecarManager.verifyAccessToken(tok))) return true;
+            return false;
+          };
           const cookieToken = getCookie(req, 'token');
-          if (!cookieToken || !safeCompare(cookieToken, self.authToken)) {
+          if (!(await accepts(cookieToken))) {
             // Check ?token= query param — set cookie via Set-Cookie and redirect
             const queryToken = url.searchParams.get('token');
-            if (queryToken && safeCompare(queryToken, self.authToken)) {
+            if (await accepts(queryToken)) {
               const cleanParams = new URLSearchParams(url.searchParams);
               cleanParams.delete('token');
               const qs = cleanParams.toString();
               const redirectTo = pathname + (qs ? '?' + qs : '');
+              // Mark the cookie Secure whenever the connection is TLS (directly,
+              // or terminated upstream and forwarded) so the token can't leak
+              // over a downgraded http request to the same host.
+              const xfProto = (req.headers.get('x-forwarded-proto') ?? '').split(',')[0]?.trim();
+              const isHttps = url.protocol === 'https:' || xfProto === 'https';
+              const cookie = `token=${queryToken}; Path=/; SameSite=Lax; HttpOnly` +
+                (isHttps ? '; Secure' : '');
               return new Response(null, {
                 status: 302,
                 headers: {
                   'Location': redirectTo || '/',
-                  'Set-Cookie': `token=${queryToken}; Path=/; SameSite=Lax; HttpOnly`,
+                  'Set-Cookie': cookie,
                 },
               });
             }

@@ -24,12 +24,24 @@ import { DEFAULT_RPC_TIMEOUTS } from './protocol.ts';
 import { EventScheduler } from './scheduler.ts';
 import { RPCTracker } from './rpc.ts';
 import { SidecarConnection } from './connection.ts';
+import { classifySidecarVersion, SIDECAR_MIN_VERSION, SIDECAR_RECOMMENDED_VERSION } from './compat.ts';
 import { chmodWithWarning, secureDirectory, secureWriteFile } from '../util/fs-secure.ts';
+import { computeAnonId } from '../telemetry/anon-id.ts';
 
 const ALG = 'ES256';
 const KEY_DIR_NAME = 'sidecar-keys';
 const PRIVATE_KEY_FILE = 'private.pem';
 const PUBLIC_KEY_FILE = 'public.pem';
+
+// Short-lived access tokens. The enrollment JWT is a long-lived REFRESH-style
+// credential that never leaves the sidecar except as an Authorization: Bearer
+// header to /sidecar/connect and the token-mint endpoint. Everything on the
+// data plane (panel /api fetches, the /ws control socket) authenticates with
+// one of these instead: minted on demand from the enrollment JWT, signed with
+// the same ES256 key, scoped by audience, and verified statelessly (signature +
+// exp + aud, no DB hit) so a leak is bounded to the TTL rather than forever.
+const ACCESS_TOKEN_AUDIENCE = 'brain-api';
+const ACCESS_TOKEN_TTL_SECONDS = 600; // 10 minutes
 
 // Localhost host check anchored: matches `localhost`, `localhost:PORT`, but
 // not e.g. `notlocalhost.example.com`. Used both for enrollment URL scheme
@@ -96,7 +108,15 @@ export class SidecarManager implements Service {
   private sidecarConnections = new Map<string, SidecarConnection>();
   private progressListeners = new Set<(sidecarId: string, rpcId: string, progress: number, message?: string) => void>();
   private eventListeners = new Set<(sidecarId: string, event: SidecarEvent) => void>();
+  // Two parallel notify APIs:
+  //   • onConnect(id) — main's lightweight handler (just an id, fires on
+  //     each WS reconnect for routing-table refreshes)
+  //   • onSidecarConnected(sidecar) / onSidecarDisconnected(id) — our
+  //     ambient-UI pebble-spawn handler (needs the full ConnectedSidecar
+  //     to read capabilities before deciding to spawn)
   private connectListeners = new Set<(sidecarId: string) => void>();
+  private connectedListeners = new Set<(sidecar: ConnectedSidecar) => void>();
+  private disconnectedListeners = new Set<(sidecarId: string) => void>();
 
   constructor(dataDir: string) {
     this.dataDir = dataDir;
@@ -159,7 +179,7 @@ export class SidecarManager implements Service {
       });
 
       // Register handlers for each sidecar observer event type
-      const sidecarEventTypes = ['screen_capture', 'context_changed', 'idle_detected', 'clipboard_change'];
+      const sidecarEventTypes = ['screen_capture', 'context_changed', 'idle_detected', 'clipboard_change', 'file_change', 'process_started', 'process_stopped', 'notification', 'pebble.summon', 'pebble.palette', 'pebble.blind_toggle', 'pebble.open_answer', 'panel.bounds_changed', 'panel.closed', 'audio.session_start', 'audio.session_end', 'audio.wake_segment', 'region.captured', 'region.cancelled', 'sub_pebble.clicked', 'sub_pebble.open_full'];
       const sidecarEventHandler = async (sidecarId: string, event: SidecarEvent) => {
         for (const listener of this.eventListeners) {
           listener(sidecarId, event);
@@ -324,12 +344,16 @@ export class SidecarManager implements Service {
 
     const { brainWs, jwksUrl } = buildEnrollmentUrls(this.brainUrl);
 
-    // Sign JWT
+    // Sign JWT. `bid` is the brain's anonymous telemetry id so the sidecar can
+    // report which brain it belongs to (for the sidecars-per-brain analytics);
+    // it is the same digest the brain reports in its own telemetry, never the
+    // raw hostname/username.
     const token = await new SignJWT({
       sid: id,
       name: trimmed,
       brain: brainWs,
       jwks: jwksUrl,
+      bid: computeAnonId(),
     } satisfies Omit<SidecarTokenClaims, 'sub' | 'jti' | 'iat'>)
       .setProtectedHeader({ alg: ALG, kid: this.keyId })
       .setSubject(`sidecar:${id}`)
@@ -398,13 +422,22 @@ export class SidecarManager implements Service {
     // Persist connection details to DB so they're available even when offline
     const db = getDb();
     db.run(
-      `UPDATE sidecars SET last_seen_at = datetime('now'), hostname = ?, os = ?, platform = ?, capabilities = ? WHERE id = ?`,
-      [sidecar.hostname, sidecar.os, sidecar.platform, JSON.stringify(sidecar.capabilities), sidecar.id],
+      `UPDATE sidecars SET last_seen_at = datetime('now'), hostname = ?, os = ?, platform = ?, capabilities = ?, version = ? WHERE id = ?`,
+      [sidecar.hostname, sidecar.os, sidecar.platform, JSON.stringify(sidecar.capabilities), sidecar.version, sidecar.id],
     );
     console.log(`[SidecarManager] Sidecar connected: ${sidecar.name} (${sidecar.id})`);
+    // Fire both listener flavours — main uses onConnect(id) for routing,
+    // our ambient block uses onSidecarConnected(sidecar) for the pebble spawn.
     for (const listener of this.connectListeners) {
       try { listener(sidecar.id); } catch (err) {
         console.error('[SidecarManager] connect listener error:', err instanceof Error ? err.message : err);
+      }
+    }
+    for (const listener of this.connectedListeners) {
+      try {
+        listener(sidecar);
+      } catch (err) {
+        console.warn(`[SidecarManager] connected listener threw:`, err);
       }
     }
   }
@@ -415,7 +448,24 @@ export class SidecarManager implements Service {
     this.connected.delete(id);
     if (sc) {
       console.log(`[SidecarManager] Sidecar disconnected: ${sc.name} (${id})`);
+      for (const listener of this.disconnectedListeners) {
+        try {
+          listener(id);
+        } catch (err) {
+          console.warn(`[SidecarManager] disconnected listener threw:`, err);
+        }
+      }
     }
+  }
+
+  /** Register a callback fired after a sidecar registers (post-handshake). */
+  onSidecarConnected(listener: (sidecar: ConnectedSidecar) => void): void {
+    this.connectedListeners.add(listener);
+  }
+
+  /** Register a callback fired when a sidecar disconnects. */
+  onSidecarDisconnected(listener: (sidecarId: string) => void): void {
+    this.disconnectedListeners.add(listener);
   }
 
   /** Update capabilities for a connected sidecar (called on config reload) */
@@ -458,12 +508,63 @@ export class SidecarManager implements Service {
 
       const claims = payload as unknown as SidecarTokenClaims;
 
+      // A short-lived access token (aud=brain-api) must never be accepted as an
+      // enrollment credential. validateToken gates /sidecar/connect and the
+      // token-mint endpoint; if an access token passed here it could mint fresh
+      // access tokens indefinitely, defeating its TTL. Enrollment JWTs carry no
+      // audience, so reject anything bearing the access-token audience.
+      if ((payload as Record<string, unknown>).aud === ACCESS_TOKEN_AUDIENCE) {
+        return null;
+      }
+
       // Check sidecar is still enrolled
       if (!claims.sid || !this.isEnrolled(claims.sid)) {
         return null;
       }
 
       return claims;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Mint a short-lived access token for an enrolled sidecar. This is the only
+   * credential that authenticates the data plane (panel /api fetches + /ws); the
+   * enrollment JWT is never accepted there. Enrollment is checked here at mint
+   * time, so a revoked sidecar can't obtain new tokens (and existing ones expire
+   * within the TTL). Returns null if the sidecar isn't enrolled or keys aren't
+   * loaded.
+   */
+  async issueAccessToken(sid: string): Promise<{ token: string; expiresIn: number } | null> {
+    if (!this.privateKey) return null;
+    if (!sid || !this.isEnrolled(sid)) return null;
+    const token = await new SignJWT({ sid })
+      .setProtectedHeader({ alg: ALG, kid: this.keyId })
+      .setSubject(`sidecar:${sid}`)
+      .setAudience(ACCESS_TOKEN_AUDIENCE)
+      .setIssuedAt()
+      .setExpirationTime(`${ACCESS_TOKEN_TTL_SECONDS}s`)
+      .sign(this.privateKey);
+    return { token, expiresIn: ACCESS_TOKEN_TTL_SECONDS };
+  }
+
+  /**
+   * Verify a short-lived access token. Returns { sid } if the signature,
+   * audience, and expiry all check out, else null. Deliberately stateless (no
+   * DB / isEnrolled lookup): the short TTL is the revocation mechanism, which
+   * also keeps this cheap on every authenticated request.
+   */
+  async verifyAccessToken(token: string): Promise<{ sid: string } | null> {
+    if (!this.publicKey) return null;
+    try {
+      const { payload } = await jwtVerify(token, this.publicKey, {
+        algorithms: [ALG],
+        audience: ACCESS_TOKEN_AUDIENCE,
+      });
+      const sid = typeof payload.sid === 'string' ? payload.sid : '';
+      if (!sid) return null;
+      return { sid };
     } catch {
       return null;
     }
@@ -496,6 +597,38 @@ export class SidecarManager implements Service {
       try {
         const parsed = JSON.parse(message);
         if (parsed.type === 'register') {
+          const reportedVersion = typeof parsed.version === 'string' && parsed.version ? parsed.version : 'dev';
+          const verdict = classifySidecarVersion(reportedVersion);
+
+          if (verdict === 'blocked') {
+            // Hard floor: the sidecar is too old for this brain. Tell it why and
+            // close the socket. We do NOT registerConnection — an incompatible
+            // sidecar must not operate.
+            console.warn(`[SidecarManager] Rejecting sidecar ${sidecarId}: version ${reportedVersion} < required ${SIDECAR_MIN_VERSION}`);
+            try {
+              ws.send(JSON.stringify({
+                type: 'register_rejected',
+                reason: 'incompatible',
+                min: SIDECAR_MIN_VERSION,
+                your_version: reportedVersion,
+              }));
+            } catch { /* socket may already be gone */ }
+            ws.close(4001, 'sidecar version incompatible');
+            return;
+          }
+
+          if (verdict === 'suggested') {
+            // Compatible but below RECOMMENDED — accept and advise an update.
+            try {
+              ws.send(JSON.stringify({
+                type: 'register_ack',
+                update_suggested: true,
+                recommended: SIDECAR_RECOMMENDED_VERSION,
+              }));
+            } catch { /* best-effort */ }
+            console.log(`[SidecarManager] Sidecar ${sidecarId} v${reportedVersion} is below recommended ${SIDECAR_RECOMMENDED_VERSION} — update suggested`);
+          }
+
           const record = this.getSidecar(sidecarId);
           this.registerConnection({
             id: sidecarId,
@@ -503,6 +636,8 @@ export class SidecarManager implements Service {
             hostname: parsed.hostname ?? 'unknown',
             os: parsed.os ?? 'unknown',
             platform: parsed.platform ?? 'unknown',
+            version: reportedVersion,
+            updateStatus: verdict,
             capabilities: parsed.capabilities ?? [],
             unavailableCapabilities: parsed.unavailable_capabilities ?? [],
             connectedAt: new Date(),
@@ -612,6 +747,8 @@ export class SidecarManager implements Service {
       platform: conn?.platform ?? record.platform ?? undefined,
       capabilities: conn?.capabilities ?? parsedCapabilities,
       unavailable_capabilities: conn?.unavailableCapabilities,
+      version: conn?.version ?? record.version ?? undefined,
+      update_status: conn?.updateStatus,
     };
   }
 }

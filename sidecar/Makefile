@@ -1,7 +1,21 @@
 MODULE   := github.com/jarvis/sidecar
-VERSION  := 0.1.0
-BIN_NAME := jarvis-sidecar
-LDFLAGS  := -s -w
+# Single source of truth for the sidecar's own (brain-decoupled) version. The
+# VERSION file is read here and injected into the binary via -X; CI asserts the
+# `sidecar-v*` release tag matches it.
+VERSION  := $(shell cat VERSION 2>/dev/null || echo dev)
+BIN_NAME := jarvis
+LDFLAGS  := -s -w -X main.sidecarVersion=$(VERSION)
+
+# macOS: build against the 11.0 deployment target (same as CI's
+# `clang -target <arch>-apple-macos11`) so APIs that newer SDKs mark obsoleted --
+# e.g. CGWindowListCreateImage, made unavailable in the macOS 15 SDK -- stay
+# compilable. Without this, `make build` on a macOS 15+ host fails to build.
+ifeq ($(shell uname),Darwin)
+export MACOSX_DEPLOYMENT_TARGET := 11.0
+endif
+
+# Windows ships as a GUI-subsystem app (no console window): the cross-compile
+# loops below append `-H windowsgui` to LDFLAGS when $$os = windows.
 
 PLATFORMS := \
 	darwin/arm64 \
@@ -13,9 +27,16 @@ PLATFORMS := \
 # Map Go os/arch to npm package names
 npm_dir = $(subst darwin/arm64,darwin-arm64,$(subst darwin/amd64,darwin-x64,$(subst linux/amd64,linux-x64,$(subst linux/arm64,linux-arm64,$(subst windows/amd64,win32-x64,$1)))))
 
-.PHONY: all build test vet clean dist npm-pack build-ocr-helper build-test dist-test
+.PHONY: all build test vet clean dist npm-pack build-ocr-helper build-test dist-test manifest
 
 all: test build
+
+# Regenerate the embedded Windows application manifest resource from
+# jarvis.manifest. Go auto-links rsrc_windows_amd64.syso into windows/amd64
+# builds. The manifest declares OS compatibility so the Program Compatibility
+# Assistant doesn't flag the app as a (failed) installer. Requires mingw windres.
+manifest:
+	x86_64-w64-mingw32-windres --input jarvis.rc --output rsrc_windows_amd64.syso --output-format=coff
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o $(BIN_NAME) .
@@ -36,7 +57,8 @@ dist-test:
 		ext=""; \
 		[ "$$os" = "windows" ] && ext=".exe"; \
 		echo "Building $$os/$$arch test-enabled..."; \
-		GOOS=$$os GOARCH=$$arch go build -tags sidecartest -ldflags "$(LDFLAGS)" \
+		lf="$(LDFLAGS)"; [ "$$os" = "windows" ] && lf="$$lf -H windowsgui"; \
+		GOOS=$$os GOARCH=$$arch go build -tags sidecartest -ldflags "$$lf" \
 			-o "dist/$${os}-$${arch}/$(BIN_NAME)-test$${ext}" . || exit 1; \
 	done
 
@@ -90,7 +112,8 @@ dist: test vet
 		ext=""; \
 		[ "$$os" = "windows" ] && ext=".exe"; \
 		echo "Building $$os/$$arch..."; \
-		GOOS=$$os GOARCH=$$arch go build -ldflags "$(LDFLAGS)" \
+		lf="$(LDFLAGS)"; [ "$$os" = "windows" ] && lf="$$lf -H windowsgui"; \
+		GOOS=$$os GOARCH=$$arch go build -ldflags "$$lf" \
 			-o "dist/$${os}-$${arch}/$(BIN_NAME)$${ext}" . || exit 1; \
 	done
 
@@ -132,9 +155,10 @@ npm-publish: npm-pack
 	@echo "Publishing main package..."
 	cd npm/jarvis-sidecar && npm publish --access public
 
-# Update version across all package.json files
+# Update version across the VERSION file (source of truth) + all package.json
 set-version:
 	@if [ -z "$(V)" ]; then echo "Usage: make set-version V=0.2.0"; exit 1; fi
+	@printf '%s\n' "$(V)" > VERSION
 	@for f in npm/*/package.json; do \
 		sed -i 's/"version": ".*"/"version": "$(V)"/' $$f; \
 	done

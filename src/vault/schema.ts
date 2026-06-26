@@ -436,6 +436,14 @@ function createTables(db: Database): void {
   db.run(`CREATE INDEX IF NOT EXISTS idx_captures_retention ON screen_captures(retention_tier)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_captures_app ON screen_captures(app_name)`);
 
+  // Migration: thumbnail_path was added to the schema after the table was
+  // created on existing installs. CREATE TABLE IF NOT EXISTS is a no-op
+  // when the table exists, so older databases miss the column and every
+  // capture insert fails with "no column named thumbnail_path". ALTER
+  // adds it; the try/catch silently swallows the "duplicate column" error
+  // on subsequent runs.
+  try { db.run('ALTER TABLE screen_captures ADD COLUMN thumbnail_path TEXT'); } catch { /* already present */ }
+
   db.run(`
     CREATE TABLE IF NOT EXISTS awareness_sessions (
       id TEXT PRIMARY KEY,
@@ -660,6 +668,9 @@ function createTables(db: Database): void {
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_sidecars_name ON sidecars(name)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_sidecars_token_id ON sidecars(token_id)`);
+  // Sidecar's own (brain-decoupled) version, reported on register. Added later;
+  // ALTER in try/catch is the migration pattern used throughout this file.
+  try { db.run('ALTER TABLE sidecars ADD COLUMN version TEXT'); } catch { /* already present */ }
 
   // Settings table: key-value store for dashboard-managed configuration
   db.run(`

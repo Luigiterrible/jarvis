@@ -27,6 +27,7 @@ JARVIS is not a chatbot with tools. It is a persistent daemon that sees your scr
   - [Table of Contents](#table-of-contents)
   - [🔍 What Makes JARVIS Different](#-what-makes-jarvis-different)
   - [⚡ Quick Start](#-quick-start)
+  - [🪨 Ambient mode (recommended)](#-ambient-mode-recommended)
   - [☁️ Managed Hosting](#️-managed-hosting)
   - [💡 Use Cases](#-use-cases)
   - [📋 Requirements](#-requirements)
@@ -80,6 +81,27 @@ jarvis start -d                   # Start as background daemon
 ```
 
 Open `http://localhost:3142` — the dashboard walks you through LLM provider, voice, and a quick conversational profile interview the first time you visit.
+
+---
+
+## 🪨 Ambient mode
+
+JARVIS ships a "dashboard-less" experience built around a small cursor-following pebble — **on by default** after onboarding. Just run:
+
+```bash
+bun run start
+```
+
+What you get:
+
+- **Pebble** — a small paper-toned disc that follows your cursor. Wake-word ("Hey Jarvis"), `Ctrl+Space`, or click summons it. Long-press the disc to blind awareness instantly (privacy toggle); the eye glyph next to it shows when JARVIS is actively reading your screen.
+- **Native windows** — every dashboard room (workflows, memory, settings, …) opens as a real Windows window via voice ("open settings", "show me workflows") or `Ctrl+K`. No browser tab.
+- **Sub-pebble rail** — say "in the background, research X" and a colored sub-pebble flies to the right edge of your screen. Click it to see what the agent is doing; "open full ↗" pops a dedicated result panel.
+- **Voice-first** — "what's on my screen?", "close all background agents", "open the workflows window", "in the background, summarize today's meeting notes" — all routed inline, no LLM round-trip for the common verbs.
+
+Currently **Windows-only** (cross-platform ports planned). The `localhost:3142` dashboard still works as a fallback / debug surface.
+
+> **Opt out:** set `JARVIS_AMBIENT_UI=0` to disable the pebble + sidecar voice loop (useful for headless servers, CI, or users who only want the web dashboard).
 
 ---
 
@@ -248,19 +270,38 @@ bun install -g @usejarvis/sidecar
 
 ### 3. Run the sidecar
 
-Paste and run the copied command on the machine where you installed the sidecar:
+Just start it:
 
 ```bash
-jarvis-sidecar --token <your-token>
+jarvis
 ```
 
-The sidecar saves the token locally, so on subsequent runs you just need:
+The first time it runs unconfigured, a small **setup window** pops up asking for
+the enrollment token — paste the token you copied and click **Connect**. The
+sidecar saves it locally (`~/.jarvis/sidecar.yaml`) and connects.
+
+Prefer the terminal / a headless box? Pass the token on the CLI instead (no
+window):
 
 ```bash
-jarvis-sidecar
+jarvis --token <your-token>
 ```
 
-Once connected, the sidecar appears as online in the Settings page where you can configure its capabilities (terminal, filesystem, desktop, browser, clipboard, screenshot, awareness).
+Either way, subsequent runs are just `jarvis` (the saved token is reused).
+
+Once connected, the sidecar appears as online in the Settings page where you can configure its capabilities (terminal, filesystem, desktop, browser, clipboard, screenshot, awareness, file watch, processes, notifications). The host-sensing observers (clipboard, file watch, process monitor, desktop notifications) run inside the sidecar on your machine and stream to the brain - the brain no longer observes its own host.
+
+### Versioning & updates
+
+The sidecar is versioned **independently of the brain** (`bun update -g @usejarvis/sidecar`, or grab a newer binary from [GitHub Releases](https://github.com/vierisid/jarvis/releases) -- the `sidecar-vX.Y.Z` releases). Run `jarvis --version` to see what you have.
+
+On connect, the brain checks the sidecar's version against its compatibility floors and surfaces the result in **Settings -> Sidecar**:
+
+- **OK** -- up to date enough; nothing to do.
+- **Update available** -- still compatible, but the brain recommends a newer sidecar; update when convenient.
+- **Update required** -- too old for this brain; the connection is refused and the sidecar logs an "update required" message. Update the sidecar and restart it.
+
+Local development builds report `dev` and are never blocked.
 
 ---
 
