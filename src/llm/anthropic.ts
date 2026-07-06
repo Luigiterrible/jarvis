@@ -63,6 +63,8 @@ type AnthropicResponse = {
   usage: {
     input_tokens: number;
     output_tokens: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
   };
 };
 
@@ -71,7 +73,7 @@ type AnthropicStreamEvent =
   | { type: 'content_block_start'; index: number; content_block: AnthropicContentBlock }
   | { type: 'content_block_delta'; index: number; delta: { type: 'text_delta'; text: string } | { type: 'input_json_delta'; partial_json: string } }
   | { type: 'content_block_stop'; index: number }
-  | { type: 'message_delta'; delta: { stop_reason: string; usage?: { output_tokens: number } } }
+  | { type: 'message_delta'; delta: { stop_reason: string; usage?: { output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } } }
   | { type: 'message_stop' }
   | { type: 'error'; error: { type: string; message: string } };
 
@@ -92,15 +94,32 @@ function modelRejectsTemperature(model: string): boolean {
   return /claude-opus-4-7/i.test(model);
 }
 
+/**
+ * A system prompt block. Anthropic renders tools -> system -> messages, so a
+ * cache_control marker on a system block caches the tools and everything in
+ * the system prompt up to (and including) that block.
+ */
+type AnthropicSystemBlock = {
+  type: 'text';
+  text: string;
+  cache_control?: { type: 'ephemeral' };
+};
+
 export class AnthropicProvider implements LLMProvider {
   name = 'anthropic';
   private apiKey: string;
   private defaultModel: string;
+  private promptCache: boolean;
   private apiUrl = 'https://api.anthropic.com/v1/messages';
 
-  constructor(apiKey: string, defaultModel = 'claude-sonnet-4-5-20250929') {
+  constructor(
+    apiKey: string,
+    defaultModel = 'claude-sonnet-4-5-20250929',
+    opts?: { promptCache?: boolean },
+  ) {
     this.apiKey = apiKey;
     this.defaultModel = defaultModel;
+    this.promptCache = opts?.promptCache !== false;
   }
 
   /**
@@ -149,13 +168,14 @@ export class AnthropicProvider implements LLMProvider {
     const compactedMessages = compactHistory(messages, budget);
 
     const { system, messages: anthropicMessages } = this.convertMessages(compactedMessages);
+    this.applyLastMessageBreakpoint(anthropicMessages);
     const body: Record<string, unknown> = {
       model,
       messages: anthropicMessages,
       max_tokens,
     };
 
-    if (system) body.system = system;
+    if (system && system.length > 0) body.system = system;
     if (temperature !== undefined && !modelRejectsTemperature(model)) {
       body.temperature = temperature;
     }
@@ -177,6 +197,7 @@ export class AnthropicProvider implements LLMProvider {
     const compactedMessages = compactHistory(messages, budget);
 
     const { system, messages: anthropicMessages } = this.convertMessages(compactedMessages);
+    this.applyLastMessageBreakpoint(anthropicMessages);
     const body: Record<string, unknown> = {
       model,
       messages: anthropicMessages,
@@ -184,16 +205,13 @@ export class AnthropicProvider implements LLMProvider {
       stream: true,
     };
 
-    if (system) body.system = system;
+    if (system && system.length > 0) body.system = system;
     if (temperature !== undefined && !modelRejectsTemperature(model)) {
       body.temperature = temperature;
     }
     if (tools && tools.length > 0) {
       body.tools = this.convertTools(tools);
       // Anthropic automatically uses tools when provided (no explicit tool_choice needed)
-    }
-    if (tools && tools.length > 0) {
-      body.tools = this.convertTools(tools);
     }
 
     let response: Response;
@@ -214,7 +232,7 @@ export class AnthropicProvider implements LLMProvider {
     const toolCalls: LLMToolCall[] = [];
     let currentToolCall: { id: string; name: string; input_json: string } | null = null;
     let stopReason: string | null = null;
-    let usage = { input_tokens: 0, output_tokens: 0 };
+    const usage: LLMResponse['usage'] = { input_tokens: 0, output_tokens: 0 };
     let responseModel = model;
 
     try {
@@ -241,6 +259,12 @@ export class AnthropicProvider implements LLMProvider {
 
             if (event.type === 'message_start' && event.message.usage) {
               usage.input_tokens = event.message.usage.input_tokens;
+              if (event.message.usage.cache_read_input_tokens !== undefined) {
+                usage.cache_read_input_tokens = event.message.usage.cache_read_input_tokens;
+              }
+              if (event.message.usage.cache_creation_input_tokens !== undefined) {
+                usage.cache_creation_input_tokens = event.message.usage.cache_creation_input_tokens;
+              }
               if (event.message.model) responseModel = event.message.model;
             } else if (event.type === 'content_block_start') {
               if (event.content_block.type === 'tool_use') {
@@ -281,6 +305,12 @@ export class AnthropicProvider implements LLMProvider {
               stopReason = event.delta.stop_reason;
               if (event.delta.usage) {
                 usage.output_tokens = event.delta.usage.output_tokens;
+                if (event.delta.usage.cache_read_input_tokens !== undefined) {
+                  usage.cache_read_input_tokens = event.delta.usage.cache_read_input_tokens;
+                }
+                if (event.delta.usage.cache_creation_input_tokens !== undefined) {
+                  usage.cache_creation_input_tokens = event.delta.usage.cache_creation_input_tokens;
+                }
               }
             } else if (event.type === 'error') {
               yield {
@@ -326,11 +356,36 @@ export class AnthropicProvider implements LLMProvider {
   }
 
   private convertMessages(messages: LLMMessage[]): {
-    system?: string;
+    system?: AnthropicSystemBlock[];
     messages: AnthropicMessage[];
   } {
-    const systemMessages = messages.filter(m => m.role === 'system');
-    const system = systemMessages.map(m => typeof m.content === 'string' ? m.content : m.content.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('\n')).join('\n\n') || undefined;
+    // One block per system message, boundaries preserved so a cache_control
+    // marker can sit exactly at the static/dynamic split. The '\n\n' joiner
+    // is PREPENDED to every block except the first, keeping the rendered
+    // prompt text byte-identical to the previous string-join behavior while
+    // keeping the first (cache-marked, static) block's bytes independent of
+    // whether a dynamic block follows - appending the separator instead
+    // would rewrite the cache entry whenever the dynamic message flips
+    // between empty and non-empty.
+    const systemTexts = messages
+      .filter(m => m.role === 'system')
+      .map(m => ({
+        text: typeof m.content === 'string' ? m.content : m.content.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('\n'),
+        cache: m.cache === true,
+      }))
+      .filter(m => m.text.length > 0); // Anthropic rejects empty text blocks
+
+    const lastMarked = this.promptCache
+      ? systemTexts.reduce((acc, m, idx) => (m.cache ? idx : acc), -1)
+      : -1;
+
+    const system: AnthropicSystemBlock[] | undefined = systemTexts.length > 0
+      ? systemTexts.map((m, idx) => ({
+          type: 'text' as const,
+          text: idx > 0 ? `\n\n${m.text}` : m.text,
+          ...(idx === lastMarked ? { cache_control: { type: 'ephemeral' as const } } : {}),
+        }))
+      : undefined;
 
     const anthropicMessages: AnthropicMessage[] = [];
     const nonSystem = messages.filter(m => m.role !== 'system');
@@ -394,6 +449,43 @@ export class AnthropicProvider implements LLMProvider {
     return { system, messages: anthropicMessages };
   }
 
+  /**
+   * Incremental conversation caching: mark the final content block of the
+   * last message so each request caches the entire rendered prefix
+   * (tools + system + all messages). Within a ReAct loop the prefix grows
+   * monotonically, so iteration N reads what iteration N-1 wrote.
+   *
+   * Only applied to conversational requests (at least one assistant turn
+   * present). One-shot calls (classification, extraction, summarization)
+   * never resend their prefix, so a breakpoint there would pay the 1.25x
+   * cache-write premium with zero reads.
+   *
+   * Mutates the converted messages in place. Together with the (single)
+   * system-block marker this emits at most 2 of the 4 allowed breakpoints.
+   */
+  private applyLastMessageBreakpoint(anthropicMessages: AnthropicMessage[]): void {
+    if (!this.promptCache) return;
+    if (!anthropicMessages.some(m => m.role === 'assistant')) return;
+    const last = anthropicMessages[anthropicMessages.length - 1];
+    if (!last) return;
+
+    if (typeof last.content === 'string') {
+      if (last.content.length === 0) return; // never emit empty text blocks
+      last.content = [{ type: 'text', text: last.content, cache_control: { type: 'ephemeral' } }];
+      return;
+    }
+    const lastBlock = last.content[last.content.length - 1];
+    if (!lastBlock) return;
+    // Copy-on-write: content arrays can be shared with the caller's message
+    // history (convertMessages passes them through by reference). Mutating in
+    // place would leak cache_control into the history and accumulate extra
+    // breakpoints on subsequent requests.
+    last.content = [
+      ...last.content.slice(0, -1),
+      { ...lastBlock, cache_control: { type: 'ephemeral' } },
+    ];
+  }
+
   private convertTools(tools: LLMTool[]): AnthropicToolDef[] {
     return tools.map(tool => ({
       name: tool.name,
@@ -424,6 +516,10 @@ export class AnthropicProvider implements LLMProvider {
       usage: {
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
+        ...(response.usage.cache_read_input_tokens !== undefined
+          ? { cache_read_input_tokens: response.usage.cache_read_input_tokens } : {}),
+        ...(response.usage.cache_creation_input_tokens !== undefined
+          ? { cache_creation_input_tokens: response.usage.cache_creation_input_tokens } : {}),
       },
       model: response.model,
       finish_reason: this.mapStopReason(response.stop_reason),
