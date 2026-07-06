@@ -46,6 +46,9 @@ ${c.bold('Commands:')}
   ${c.cyan('update')}    Update JARVIS (dispatches based on install method)
   ${c.cyan('uninstall')} Remove JARVIS (dispatches based on install method)
   ${c.cyan('doctor')}    Check environment and connectivity
+  ${c.cyan('enroll')}    Enroll a sidecar device: mint + store its JWT (no daemon needed)
+  ${c.cyan('sidecars')}  List enrolled devices (sidecars list [--json])
+  ${c.cyan('revoke')}    Revoke an enrolled device by sid
   ${c.cyan('version')}   Print version number
   ${c.cyan('help')}      Show this help message
 
@@ -68,6 +71,10 @@ ${c.bold('Examples:')}
   jarvis logs -f                Follow live log output
   jarvis update                 Update to latest version
   jarvis uninstall              Remove JARVIS from this machine
+  jarvis enroll "desktop-NA23"  Mint an enrollment token for a device
+  jarvis enroll <name> --rotate Re-enroll invalidating all previous tokens
+  jarvis sidecars list --json   List devices (machine-readable)
+  jarvis revoke <sid>           Revoke a device's access
   jarvis doctor                 Check if everything is working
 `);
 }
@@ -111,8 +118,12 @@ async function cmdStart(args: string[]): Promise<void> {
   const { homedir } = await import('node:os');
   const cfgPath = join(homedir(), '.jarvis', 'config.yaml');
   if (!_exists(cfgPath)) {
-    console.log(c.cyan('First-run detected — finish setup in your browser:'));
-    console.log(c.dim(`  → http://localhost:${port ?? 3142}`));
+    console.log(c.cyan('First-run detected. Jarvis is JWT-only by default:'));
+    console.log(c.dim('  1. jarvis enroll "<device-name>"   mint your device token'));
+    console.log(c.dim('  2. paste the token into the sidecar (desktop app) to connect'));
+    console.log(c.dim('  Setting up without a sidecar? Put "auth:\n  insecure_open_access: true"'));
+    console.log(c.dim(`  in ~/.jarvis/config.yaml, open http://localhost:${port ?? 3142}, and`));
+    console.log(c.dim('  REMOVE the flag once your device is enrolled.'));
     console.log('');
   }
 
@@ -202,11 +213,18 @@ async function cmdStop(args: string[] = []): Promise<void> {
 
   const resolution = resolveStopPort({ cliPort });
   const port = resolution.port;
-  if (resolution.source !== 'lockfile' && resolution.source !== 'default') {
+  if (port !== null && resolution.source !== 'lockfile' && resolution.source !== 'default') {
     console.log(c.dim(`  Using port ${port} (from ${resolution.source})`));
+  }
+  if (port === null) {
+    console.log(c.dim('  Unix-socket mode (daemon.listen) — pid-only stop, no port cleanup'));
   }
 
   if (!pid) {
+    if (port === null) {
+      console.log(c.yellow('JARVIS is not running.'));
+      return;
+    }
     const cleanup = await ensurePortReleased(port);
     if (cleanup.terminated.length > 0 || cleanup.forced.length > 0) {
       const details = cleanup.forced.length > 0
@@ -235,6 +253,11 @@ async function cmdStop(args: string[] = []): Promise<void> {
       try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
     }
 
+    if (port === null) {
+      releaseLock();
+      console.log(c.green('✓ JARVIS daemon stopped.'));
+      return;
+    }
     const cleanup = await ensurePortReleased(port);
     releaseLock();
     if (!cleanup.released) {
@@ -402,6 +425,18 @@ switch (command) {
   case 'doctor':
     await cmdDoctor();
     break;
+  case 'enroll': {
+    const { cmdEnroll } = await import('../src/cli/devices.ts');
+    process.exit(await cmdEnroll(commandArgs));
+  }
+  case 'sidecars': {
+    const { cmdSidecars } = await import('../src/cli/devices.ts');
+    process.exit(await cmdSidecars(commandArgs));
+  }
+  case 'revoke': {
+    const { cmdRevoke } = await import('../src/cli/devices.ts');
+    process.exit(await cmdRevoke(commandArgs));
+  }
   case 'uninstall':
     await cmdUninstall();
     break;

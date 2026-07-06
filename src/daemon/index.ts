@@ -297,10 +297,26 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     noLocalTools: userConfig?.noLocalTools ?? false,
   };
 
+  // Resolve the listen spec ONCE, before anything is persisted: a malformed
+  // `daemon.listen` must fail fast here, not after the lockfile write (a
+  // stale TCP lockfile from a mid-boot crash would mislead `jarvis stop`).
+  const { resolveListen } = await import('../config/loader.ts');
+  let listen: import('../config/loader.ts').ListenSpec;
+  try {
+    listen = resolveListen({ port, listen: jarvisConfig.daemon.listen });
+  } catch (err) {
+    console.error(`\n[Daemon] ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
   // Record the actual bound port in the lockfile so `jarvis stop` knows which
   // port to verify even when the daemon was started with --port, JARVIS_PORT,
   // or a mid-run config change. No-op if we don't hold the lock (e.g. tests).
-  writeLockedPort(port);
+  // In unix-socket mode no TCP port exists to verify, so nothing is recorded
+  // and `jarvis stop` is pid-only (resolveStopPort returns port null).
+  if (listen.kind === 'tcp') {
+    writeLockedPort(port);
+  }
 
   // If dbPath is relative, make it absolute within dataDir
   if (!path.isAbsolute(config.dbPath)) {
@@ -345,6 +361,34 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     mergeLLMSettingsIntoConfig(jarvisConfig);
     logWithTimestamp('LLM settings loaded from database');
 
+    // 2c. User-owned settings (personality, voice, authority, channels,
+    // onboarding, ...) follow the same rule: the DB is the sole authority,
+    // config.yaml is read-only system config the brain never writes. A
+    // legacy file that still carries user sections seeds the DB exactly
+    // once, then env overrides are re-applied so JARVIS_* still wins.
+    const { importLegacyUserSettings, mergeUserSettingsIntoConfig } = await import('./user-settings.ts');
+    const { readRawConfigFile, applyEnvOverrides } = await import('../config/loader.ts');
+    const rawConfigFile = await readRawConfigFile().catch(() => null);
+    const importedSections = importLegacyUserSettings(rawConfigFile);
+    if (importedSections.length > 0) {
+      logWithTimestamp(`Imported legacy config.yaml sections into the DB: ${importedSections.join(', ')}`);
+    }
+    mergeUserSettingsIntoConfig(jarvisConfig);
+    applyEnvOverrides(jarvisConfig);
+    logWithTimestamp('User settings loaded from database');
+
+    // 2d. Cron timezone: hosted brains run on UTC VPSs, so every cron in the
+    // process evaluates in the user's IANA timezone from the system config.
+    if (jarvisConfig.timezone) {
+      try {
+        const { setCronTimezone } = await import('../lib/cron-scheduler.ts');
+        setCronTimezone(jarvisConfig.timezone);
+        logWithTimestamp(`Cron timezone: ${jarvisConfig.timezone}`);
+      } catch {
+        console.warn(`[Daemon] Invalid timezone "${jarvisConfig.timezone}" in config - using machine local time`);
+      }
+    }
+
     // 3. Create service registry
     registry = new ServiceRegistry();
 
@@ -384,7 +428,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const observerService = config.noLocalTools
       ? null
       : new ObserverService(reactor, coalescer, googleAuth ?? undefined, config.dataDir);
-    const wsService = new WebSocketService(config.port, agentService);
+    // Hosted mode: daemon.listen = unix:/run/jarvis/u_<id>.sock binds a unix
+    // socket and no TCP port at all (Caddy is the only way in). `listen` was
+    // resolved (and validated) once, before the lockfile write above.
+    const wsService = new WebSocketService(
+      config.port,
+      agentService,
+      listen.kind === 'unix' ? listen.path : undefined,
+    );
 
     // 5b. Create channel service for external comms (Telegram, Discord)
     const channelService = new ChannelService(jarvisConfig, agentService);
@@ -1072,13 +1123,11 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       sidecarManager.onEvent(async (sidecarId, event) => {
         if (event.event_type !== 'pebble.blind_toggle') return;
         try {
-          const { loadConfig, saveConfig } = await import('../config/loader.ts');
-          const fresh = await loadConfig();
-          const wasEnabled = fresh.awareness?.enabled ?? true;
+          const { saveUserSection } = await import('./user-settings.ts');
+          const wasEnabled = jarvisConfig.awareness?.enabled ?? true;
           const nextEnabled = !wasEnabled;
-          if (fresh.awareness) fresh.awareness.enabled = nextEnabled;
-          await saveConfig(fresh);
           (jarvisConfig.awareness as { enabled?: boolean }).enabled = nextEnabled;
+          saveUserSection('awareness', jarvisConfig.awareness);
           // Toggle live awareness service if it exists.
           if (awarenessService) awarenessService.toggle(nextEnabled);
           // Push visual: blinded = !enabled.
@@ -1144,7 +1193,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       const audioSessions = new (await import('./audio-sessions.ts')).AudioSessionRegistry();
       audioSessions.attach((cb) => sidecarManager.onEvent(cb));
       // T20 — voice-driven settings mutation. Patches `jarvisConfig`,
-      // persists via `saveConfig`, and rebuilds the live providers so
+      // persists via the DB settings store, and rebuilds the live providers so
       // the next response uses the new setting without a daemon
       // restart. The user explicitly hit this with "turn off TTS in
       // the settings" — the panel opened but the toggle didn't flip
@@ -1152,12 +1201,11 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // gap. New providers added to `jarvisConfig` (e.g. Groq STT)
       // become voice-switchable too.
       const applyTTSEnabled = async (enabled: boolean): Promise<void> => {
-        const { loadConfig, saveConfig } = await import('../config/loader.ts');
-        const fresh = await loadConfig();
-        if (!fresh.tts) fresh.tts = { enabled, provider: 'edge' };
-        else fresh.tts.enabled = enabled;
-        await saveConfig(fresh);
-        jarvisConfig.tts = fresh.tts;
+        const { saveUserSection } = await import('./user-settings.ts');
+        if (!jarvisConfig.tts) jarvisConfig.tts = { enabled, provider: 'edge' };
+        else jarvisConfig.tts.enabled = enabled;
+        saveUserSection('tts', jarvisConfig.tts);
+        const fresh = { tts: jarvisConfig.tts };
         // Rebuild the pebble's TTS provider so the next response cycle
         // either uses the new provider or skips TTS entirely.
         if (enabled) {
@@ -1184,20 +1232,19 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       };
 
       const applySTTProvider = async (provider: 'openai' | 'groq' | 'sarvam' | 'local'): Promise<boolean> => {
-        const { loadConfig, saveConfig } = await import('../config/loader.ts');
-        const fresh = await loadConfig();
-        if (!fresh.stt) fresh.stt = { provider };
+        const { saveUserSection } = await import('./user-settings.ts');
+        if (!jarvisConfig.stt) jarvisConfig.stt = { provider };
         // Refuse the switch if the target provider has no API key
         // configured — we don't want to silently break STT.
         const hasKey = (() => {
-          if (provider === 'local') return !!fresh.stt.local?.endpoint;
-          const sub = (fresh.stt as unknown as Record<string, { api_key?: string } | undefined>)[provider];
+          if (provider === 'local') return !!jarvisConfig.stt!.local?.endpoint;
+          const sub = (jarvisConfig.stt as unknown as Record<string, { api_key?: string } | undefined>)[provider];
           return !!sub?.api_key;
         })();
         if (!hasKey) return false;
-        fresh.stt.provider = provider;
-        await saveConfig(fresh);
-        jarvisConfig.stt = fresh.stt;
+        jarvisConfig.stt.provider = provider;
+        saveUserSection('stt', jarvisConfig.stt);
+        const fresh = { stt: jarvisConfig.stt };
         try {
           const { createSTTProvider } = await import('../comms/voice.ts');
           pebbleSTT = createSTTProvider(fresh.stt);
@@ -3239,15 +3286,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     if (savedEmergencyState === 'paused') emergencyController.pause();
     else if (savedEmergencyState === 'killed') emergencyController.kill();
 
-    // Persist emergency state changes to config.yaml
+    // Persist emergency state changes to the DB settings store
     emergencyController.setStateChangeCallback(async (state) => {
       wsService.broadcastEmergencyState(state);
       try {
-        const { loadConfig: reloadConfig, saveConfig: resaveConfig } = await import('../config/loader.ts');
-        const fresh = await reloadConfig();
-        if (!fresh.authority) fresh.authority = { default_level: 3 } as any;
-        fresh.authority.emergency_state = state;
-        await resaveConfig(fresh);
+        const { saveUserSection } = await import('./user-settings.ts');
+        if (!jarvisConfig.authority) jarvisConfig.authority = { default_level: 3 } as any;
+        jarvisConfig.authority.emergency_state = state;
+        saveUserSection('authority', jarvisConfig.authority);
       } catch (err) {
         console.error('[Daemon] Failed to persist emergency state:', err);
       }
@@ -3538,19 +3584,44 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const uiPublicDir = path.join(import.meta.dir, '../../ui/public');
     wsService.setPublicDir(uiPublicDir);
 
-    // 9c. Configure auth token if set
-    const authToken = jarvisConfig.auth?.token;
-    if (authToken) {
-      wsService.setAuthToken(authToken);
-      console.log('[Daemon] Auth token configured — dashboard routes require ?token= or cookie');
+    // 9c. Access model. JWT-only by default: the dashboard and every API
+    // route require a valid enrolled-device token. The one escape hatch is
+    // auth.insecure_open_access (system config), meant ONLY for first-time
+    // self-host setup before a device is enrolled.
+    if (jarvisConfig.auth?.insecure_open_access === true) {
+      wsService.setInsecureOpenAccess(true);
+      console.warn('[Daemon] ============================================================');
+      console.warn('[Daemon] WARNING: auth.insecure_open_access is enabled.');
+      console.warn('[Daemon] The dashboard and API accept requests WITHOUT authentication');
+      console.warn('[Daemon] from anyone who can reach this machine. Enroll your device');
+      console.warn('[Daemon] (`jarvis enroll "<device-name>"`, paste the token into the');
+      console.warn('[Daemon] sidecar) and remove this flag from config.yaml as soon as');
+      console.warn('[Daemon] enrollment is done.');
+      console.warn('[Daemon] ============================================================');
     } else {
-      console.warn('[Daemon] No auth token configured — dashboard is open to anyone on the network');
+      console.log('[Daemon] JWT-only access: routes require an enrolled device token (default)');
+    }
+    // Upgrade UX: the shared dashboard token was removed (JWT-only). A config
+    // still carrying auth.token would otherwise be silently ignored while the
+    // operator's bookmarked ?token= URL just 401s.
+    if ((jarvisConfig.auth as Record<string, unknown> | undefined)?.token !== undefined) {
+      console.warn('[Daemon] auth.token is no longer supported and was ignored. Access is JWT-only:');
+      console.warn('[Daemon] enroll a device (`jarvis enroll`) or, for setup only, set auth.insecure_open_access.');
     }
 
     // 9b. Apply --no-local-tools flag if set
     if (config.noLocalTools) {
       const { setNoLocalTools } = await import('../actions/tools/builtin.ts');
       setNoLocalTools(true);
+    }
+
+    // 9b'. browser.local: false (system config) - never launch a local
+    // Chrome on this machine. Hosted instances set this so no CDP port can
+    // open on a shared VPS; browser actions route to a sidecar browser
+    // (launchChrome is the enforcement choke point).
+    if (jarvisConfig.browser?.local === false) {
+      const { setLocalBrowserDisabled } = await import('../actions/tools/local-tools-guard.ts');
+      setLocalBrowserDisabled(true);
     }
 
     // 10. Start all services
@@ -4036,7 +4107,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         });
 
         // Auto-launch overlay widget (non-blocking, best-effort)
-        if (jarvisConfig.awareness?.overlay_autolaunch !== false) {
+        if (jarvisConfig.awareness?.overlay_autolaunch !== false && jarvisConfig.browser?.local !== false) {
           try {
             const overlayUrl = `http://localhost:${config.port}/overlay`;
             const browsers = ['chromium-browser', 'chromium', 'google-chrome', 'google-chrome-stable'];

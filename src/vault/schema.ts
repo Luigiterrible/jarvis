@@ -35,9 +35,12 @@ export function closeDb(): void {
 /**
  * Initialize the SQLite database with all required tables
  * @param dbPath - Path to the database file. Defaults to :memory: for testing
+ * @param opts.quiet - Suppress the stdout init log. CLIs whose stdout is
+ *   machine-readable (jarvis enroll/sidecars/revoke) set this so the token
+ *   or JSON is the ONLY thing on stdout.
  * @returns Database instance
  */
-export function initDatabase(dbPath: string = ":memory:"): Database {
+export function initDatabase(dbPath: string = ":memory:", opts?: { quiet?: boolean }): Database {
   try {
     // Close existing connection if any
     closeDb();
@@ -54,7 +57,7 @@ export function initDatabase(dbPath: string = ":memory:"): Database {
     // Create all tables
     createTables(dbInstance);
 
-    console.log(`Database initialized at: ${dbPath}`);
+    if (!opts?.quiet) console.log(`Database initialized at: ${dbPath}`);
     return dbInstance;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -671,6 +674,9 @@ function createTables(db: Database): void {
   // Sidecar's own (brain-decoupled) version, reported on register. Added later;
   // ALTER in try/catch is the migration pattern used throughout this file.
   try { db.run('ALTER TABLE sidecars ADD COLUMN version TEXT'); } catch { /* already present */ }
+  // IANA timezone reported by the sidecar on register (hosted brains run on
+  // UTC VPSs; the hosting server reads this for follow-the-night scheduling).
+  try { db.run('ALTER TABLE sidecars ADD COLUMN timezone TEXT'); } catch { /* already present */ }
 
   // Settings table: key-value store for dashboard-managed configuration
   db.run(`
