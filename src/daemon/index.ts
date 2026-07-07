@@ -47,6 +47,11 @@ import { TriggerManager } from "../workflows/runner/triggers/manager.ts";
 import { AWARENESS_EVENT_TYPE_MAP, OBSERVER_EVENT_TYPE_MAP } from "../workflows/runtime/event-types.ts";
 import { WorkflowEventBus } from "../workflows/runtime/event-bus.ts";
 import { WorkflowEventBuffer } from "../workflows/runtime/event-buffer.ts";
+import type {
+  ComposerChatMessage,
+  ComposerChatReply,
+  ComposerToolDef,
+} from "../actions/tools/workflow-composer.ts";
 import {
   bootstrapWorkflowEngine,
   type BootstrapWorkflowEngineResult,
@@ -3667,13 +3672,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           if (input.system !== undefined) messages.push({ role: "system", content: input.system });
           messages.push({ role: "user", content: input.prompt });
           // Composer expects a complete JSON tree describing the flow.
-          // A realistic flow is 500-2000 output tokens; we ask for 4096
+          // A realistic flow is 500-2000 output tokens; we ask for 8192
           // to leave room for verbose pieces (long input schemas, many
-          // steps) without surprise truncation. Ollama's default
-          // `num_predict` is 128 -- truncates every compose reply mid-
-          // JSON and crashes parsing with "Unexpected EOF". Other
-          // providers either have higher defaults or ignore the cap.
-          const reply = await llmManager.chat(messages, { max_tokens: 4096 });
+          // steps) without surprise truncation -- kept consistent with the
+          // chatTools cap below. Ollama's default `num_predict` is 128 --
+          // truncates every compose reply mid-JSON and crashes parsing with
+          // "Unexpected EOF". Other providers either have higher defaults or
+          // ignore the cap.
+          const reply = await llmManager.chat(messages, { max_tokens: 8192 });
           // `LLMResponse.content` is the assistant-text field; an earlier
           // version of this adapter read `reply.text` which doesn't
           // exist on the provider response shape, so every compose
@@ -3683,7 +3689,40 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           const content = typeof reply.content === "string" ? reply.content : "";
           return { text: content };
         },
+        // Tool-loop entrypoint: the composer discovers pieces via tools
+        // (list_pieces / get_piece_details / ...) instead of a full catalog
+        // dump. ComposerChatMessage / ComposerToolDef alias LLMMessage /
+        // LLMTool, so this is a passthrough. If the provider rejects the tools
+        // parameter, the composer catches the error and falls back to the
+        // one-shot `chat` path above. `finish_reason` is surfaced so the loop
+        // can detect a reply truncated at the token cap (a dropped submit_flow)
+        // rather than misreading it as prose.
+        async chatTools(
+          messages: ComposerChatMessage[],
+          tools: ComposerToolDef[],
+        ): Promise<ComposerChatReply> {
+          const reply = await llmManager.chat(messages, {
+            max_tokens: 8192,
+            tools,
+            tool_choice: 'auto',
+          });
+          return {
+            content: typeof reply.content === 'string' ? reply.content : '',
+            tool_calls: reply.tool_calls ?? [],
+            finish_reason: reply.finish_reason,
+          };
+        },
       };
+      // Compact community-library index for the composer's search_library
+      // tool: lets it suggest "install piece X first" when the user asks for
+      // a service that isn't installed, instead of forcing a wrong fit.
+      const { CATALOG: piecesLibraryCatalog } = await import('../workflows/pieces-library/catalog.ts');
+      const composerLibrary = piecesLibraryCatalog.map((e) => ({
+        id: e.id,
+        npmPackage: e.npmPackage,
+        displayName: e.displayName,
+        description: e.description,
+      }));
       const composerToolRegistry = toolRegistry
         ? {
             listNames: (cat?: string) => toolRegistry.list(cat).map((t) => t.name),
@@ -3721,6 +3760,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             name: r.name,
             description: r.description,
           })),
+        library: composerLibrary,
       });
       if (!toolRegistry.has('manage_workflow')) {
         toolRegistry.register(manageWorkflowTool);
