@@ -14,6 +14,7 @@ import { flushWindowState } from "./window-state.ts";
 import { ServiceRegistry } from "./services.ts";
 import { HealthMonitor } from "./health.ts";
 import { loadConfig } from "../config/loader.ts";
+import { activeTurns } from "./active-turns.ts";
 import { writeLockedPort } from "./pid.ts";
 import { AgentService } from "./agent-service.ts";
 import { createObservation } from "../vault/observations.ts";
@@ -41,6 +42,8 @@ import { sendDesktopNotification } from "../comms/desktop-notify.ts";
 import { SidecarManager, buildEnrollmentUrls } from "../sidecar/manager.ts";
 import { ensureWorkflowSchema } from "../workflows/db/index.ts";
 import { Worker as WorkflowWorker } from "../workflows/queue/worker.ts";
+import { recoverOrphanedJobs } from "../workflows/db/repos/job-queue.ts";
+import { TimerWaitpointScheduler } from "../workflows/timer-scheduler.ts";
 import { createRunFlowHandler, RUN_FLOW } from "../workflows/runner/handler.ts";
 import { createWorkflowRoutes } from "../workflows/api/routes.ts";
 import { TriggerManager } from "../workflows/runner/triggers/manager.ts";
@@ -86,6 +89,9 @@ let workflowWorker: WorkflowWorker | null = null;
 let triggerManager: TriggerManager | null = null;
 let workflowEngineShutdown: (() => Promise<void>) | null = null;
 let systemCron: import('./system-cron.ts').SystemCronService | null = null;
+let timerScheduler: TimerWaitpointScheduler | null = null;
+/** Graceful-drain deadline (ms), set from config at boot. Default 75s. */
+let drainDeadlineMs = 75_000;
 
 /**
  * Parse command line arguments
@@ -162,14 +168,38 @@ function logWithTimestamp(message: string): void {
  */
 async function handleShutdown(signal: string): Promise<void> {
   if (shutdownInProgress) {
-    console.log('\n[Daemon] Force shutdown requested, exiting immediately');
-    process.exit(1);
+    // A repeated SIGNAL means the operator/user wants to force-quit now.
+    if (signal === 'SIGINT' || signal === 'SIGTERM') {
+      console.log('\n[Daemon] Second signal — forcing immediate exit');
+      process.exit(1);
+    }
+    // But an internal error (uncaughtException/unhandledRejection) while we're
+    // already draining -- e.g. a stray rejection from a still-streaming turn --
+    // must NOT abort the drain (that would skip teardown + lose window state).
+    console.warn(`[Daemon] ${signal} during drain (ignored; drain continues)`);
+    return;
   }
 
   shutdownInProgress = true;
-  console.log(`\n[Daemon] Received ${signal}, shutting down gracefully...`);
+  console.log(`\n[Daemon] Received ${signal}, draining gracefully (deadline ${drainDeadlineMs}ms)...`);
 
   try {
+    // One wall-clock budget for the whole drain (turns + workflow), kept under
+    // the supervisor's SIGKILL grace.
+    const drainUntil = Date.now() + drainDeadlineMs;
+
+    // ---- Phase 1: QUIESCE -- stop accepting NEW work; keep in-flight alive ----
+    // New agent turns are refused (agent-service throws DrainingError); stop the
+    // timer/event SOURCES that would spawn turns or workflow jobs. The agent, WS,
+    // sidecar, and workflow worker stay UP so in-flight work can finish + stream.
+    activeTurns.quiesce();
+
+    // Stop the TIMER scheduler so it doesn't enqueue new resume jobs mid-drain.
+    if (timerScheduler) {
+      timerScheduler.stop();
+      timerScheduler = null;
+    }
+
     // Stop system cron (publishes cron.* events on the shared bus)
     if (systemCron) {
       systemCron.stop();
@@ -200,26 +230,60 @@ async function handleShutdown(signal: string): Promise<void> {
       bgAgent = null;
     }
 
-    // Stop health monitor
-    if (healthMonitor) {
-      healthMonitor.stop();
-    }
-
-    // Stop all services (reverse order: websocket -> observers -> agent)
-    if (registry) {
-      await registry.stopAll();
-    }
-
-    // Stop the trigger manager first so no new RUN_FLOW jobs get enqueued
-    // while the worker drains.
+    // Stop the trigger manager so no NEW RUN_FLOW jobs get enqueued while we
+    // drain (in-flight runs already claimed keep going).
     if (triggerManager) {
       await triggerManager.stop();
       triggerManager = null;
     }
 
-    // Stop the workflow worker (drains in-flight jobs, then exits the poll loop)
+    // Begin stopping the workflow worker NOW, unawaited: stop() flips
+    // `running=false` synchronously so it won't claim a FRESH job during the
+    // drain window (which would then get only a sliver of budget and orphan),
+    // while its already-in-flight run keeps going. Awaited, bounded, in phase 3.
+    const workerStopping = workflowWorker ? workflowWorker.stop() : null;
+
+    // ---- Phase 2: DRAIN -- await in-flight agent turns up to the deadline ----
+    // Per UPDATES.md a turn is NOT checkpointed mid-flight: if it overruns we
+    // abandon it (the process exits, the user re-asks). Workflow runs ARE
+    // durable (per-step checkpoint + resume), so they're handled in teardown.
+    const active = activeTurns.active;
+    if (active > 0) console.log(`[Drain] waiting for ${active} in-flight turn(s)...`);
+    const { drained, remaining } = await activeTurns.drain(Math.max(0, drainUntil - Date.now()));
+    if (drained) {
+      console.log('[Drain] all in-flight turns completed');
+    } else {
+      console.log(`[Drain] deadline reached; abandoning ${remaining} in-flight turn(s) (user re-asks)`);
+    }
+
+    // ---- Phase 3: TEARDOWN ----
+    // Stop health monitor
+    if (healthMonitor) {
+      healthMonitor.stop();
+    }
+
+    // Stop all services (reverse order: websocket -> observers -> agent). Safe
+    // now: turns are drained, so tearing down the agent/WS drops nothing live.
+    if (registry) {
+      await registry.stopAll();
+    }
+
+    // Stop the workflow worker (drains its in-flight run, then exits the poll
+    // loop) -- but bounded by the remaining budget. If a long run overruns, we
+    // leave it RUNNING; the next boot's recoverOrphanedJobs re-queues it to
+    // resume promptly (workflow state is durable, unlike agent turns).
     if (workflowWorker) {
-      await workflowWorker.stop();
+      const wfBudget = Math.max(2000, drainUntil - Date.now());
+      const stopped = await Promise.race([
+        (workerStopping ?? Promise.resolve()).then(() => true),
+        new Promise<boolean>((r) => {
+          const t = setTimeout(() => r(false), wfBudget);
+          t.unref?.();
+        }),
+      ]);
+      if (!stopped) {
+        console.log('[Drain] workflow worker over deadline; in-flight run left RUNNING for boot-recovery');
+      }
       workflowWorker = null;
     }
 
@@ -284,6 +348,16 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     console.error(`\n[Daemon] Failed to parse config file: ${message}`);
     console.error('[Daemon] Fix the YAML syntax in ~/.jarvis/config.yaml or delete it to use defaults.\n');
     process.exit(1);
+  }
+
+  // Drain budget: default 75s; a non-positive value falls back; cap at 85s so a
+  // misconfig can't push the drain past the supervisor's kill grace (systemd
+  // TimeoutStopSec=90) and get SIGKILLed mid-drain.
+  const configuredDrain = jarvisConfig.daemon.drain_deadline_ms;
+  drainDeadlineMs = configuredDrain && configuredDrain > 0 ? configuredDrain : 75_000;
+  if (drainDeadlineMs > 85_000) {
+    console.warn(`[Daemon] drain_deadline_ms=${drainDeadlineMs} exceeds the safe ceiling; capping at 85000`);
+    drainDeadlineMs = 85_000;
   }
 
   // Determine data directory: CLI args > config file > default
@@ -3817,11 +3891,20 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       workflowSandboxApi.setServices(backends);
       logWithTimestamp("Workflow engine service backends wired (llm/tools/notify/context/agent/events/workflows)");
 
+      // Boot recovery: re-queue any run orphaned RUNNING by a prior crash /
+      // over-deadline drain so it resumes NOW, not after the lease lapses.
+      const recovered = recoverOrphanedJobs();
+      if (recovered > 0) logWithTimestamp(`Recovered ${recovered} orphaned workflow job(s) for resume`);
+
       const flowExecutor = new EngineFlowExecutor(workflowEngineRuntime);
       workflowWorker = new WorkflowWorker({
         handlers: { [RUN_FLOW]: createRunFlowHandler({ executor: flowExecutor }) },
       });
       workflowWorker.start();
+
+      // Resume TIMER waitpoints whose delay has elapsed (incl. during downtime).
+      timerScheduler = new TimerWaitpointScheduler();
+      timerScheduler.start();
     } else {
       console.warn("[Daemon] Workflow worker not started -- engine unavailable; queued RUN_FLOW jobs will pile up");
     }
