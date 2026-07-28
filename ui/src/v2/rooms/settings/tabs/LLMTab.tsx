@@ -117,6 +117,13 @@ export function LLMTab({
   const llm = data.llm;
   const [switching, setSwitching] = useState(false);
 
+  // Read the installed Ollama models once for the whole tab. Every
+  // ModelSelector below (single mode, four tiers, fallback) shares this
+  // one fetch instead of each firing its own.
+  const ollamaModels = useOllamaModels(
+    Object.values(llm?.providers ?? {}).some((p) => p.kind === "ollama"),
+  );
+
   if (!llm) return <div className="v2-set__empty">Loading LLM config...</div>;
 
   // The mode comes straight from the backend (persisted), so it's the single
@@ -169,9 +176,9 @@ export function LLMTab({
       </section>
 
       {mode === "single" ? (
-        <SingleModelSection data={data} onToast={onToast} />
+        <SingleModelSection data={data} onToast={onToast} ollamaModels={ollamaModels} />
       ) : (
-        <MultiTierSection data={data} onToast={onToast} />
+        <MultiTierSection data={data} onToast={onToast} ollamaModels={ollamaModels} />
       )}
     </div>
   );
@@ -536,9 +543,11 @@ function NewProviderRow({
 function SingleModelSection({
   data,
   onToast,
+  ollamaModels,
 }: {
   data: SettingsHook;
   onToast: (text: string, tone?: "ok" | "warn") => void;
+  ollamaModels: string[] | null;
 }) {
   const llm = data.llm!;
 
@@ -557,6 +566,7 @@ function SingleModelSection({
         label="Default model"
         value={llm.default}
         providers={llm.providers}
+        ollamaModels={ollamaModels}
         onChange={async (ref) => {
           const r = await data.setDefaultModel(ref);
           onToast(r.message, r.ok ? "ok" : "warn");
@@ -571,9 +581,11 @@ function SingleModelSection({
 function MultiTierSection({
   data,
   onToast,
+  ollamaModels,
 }: {
   data: SettingsHook;
   onToast: (text: string, tone?: "ok" | "warn") => void;
+  ollamaModels: string[] | null;
 }) {
   const llm = data.llm!;
 
@@ -620,6 +632,7 @@ function MultiTierSection({
             sub={t.sub}
             value={llm.tiers[t.id]}
             providers={llm.providers}
+            ollamaModels={ollamaModels}
             allowClear
             onChange={async (ref) => {
               const r = await data.setTierModel(t.id, ref);
@@ -638,6 +651,7 @@ function MultiTierSection({
           label=""
           value={llm.default}
           providers={llm.providers}
+          ollamaModels={ollamaModels}
           allowClear
           onChange={async (ref) => {
             const r = await data.setDefaultModel(ref);
@@ -656,6 +670,7 @@ function ModelSelector({
   sub,
   value,
   providers,
+  ollamaModels,
   allowClear,
   onChange,
 }: {
@@ -663,6 +678,8 @@ function ModelSelector({
   sub?: string;
   value: string | null;
   providers: Record<string, LLMConfigProviderView>;
+  /** Installed Ollama models, fetched once by LLMTab and shared here. */
+  ollamaModels: string[] | null;
   allowClear?: boolean;
   onChange: (ref: string | null) => void;
 }) {
@@ -674,7 +691,7 @@ function ModelSelector({
   );
   const [selectedModel, setSelectedModel] = useState<string>(parsed?.model ?? "");
   const [customModel, setCustomModel] = useState<string>(
-    parsed?.model && !providerModels(providers, parsed.provider).includes(parsed.model)
+    parsed?.model && !providerModels(providers, parsed.provider, ollamaModels).includes(parsed.model)
       ? parsed.model
       : "",
   );
@@ -683,7 +700,7 @@ function ModelSelector({
   useEffect(() => {
     if (parsed) {
       setSelectedProvider(parsed.provider);
-      const known = providerModels(providers, parsed.provider);
+      const known = providerModels(providers, parsed.provider, ollamaModels);
       if (known.includes(parsed.model)) {
         setSelectedModel(parsed.model);
         setCustomModel("");
@@ -698,9 +715,12 @@ function ModelSelector({
       setSelectedModel("");
       setCustomModel("");
     }
-  }, [value]);
+    // `ollamaModels` participates: until the live catalog lands, a tagged id
+    // looks unknown and would be parked in the custom field. Re-run when it
+    // arrives so the dropdown snaps to the real entry.
+  }, [value, ollamaModels]);
 
-  const models = providerModels(providers, selectedProvider);
+  const models = providerModels(providers, selectedProvider, ollamaModels);
   const usesCustomOnly = models.length === 0;
   const effectiveModel = selectedModel === "__custom__" ? customModel.trim() : selectedModel;
 
@@ -733,7 +753,7 @@ function ModelSelector({
             const next = e.target.value;
             setSelectedProvider(next);
             // Reset model when provider changes - the model list is now different.
-            const nextModels = providerModels(providers, next);
+            const nextModels = providerModels(providers, next, ollamaModels);
             const defaultModel = nextModels[0] ?? "__custom__";
             setSelectedModel(defaultModel);
             setCustomModel("");
@@ -814,8 +834,38 @@ function ModelSelector({
 function providerModels(
   providers: Record<string, LLMConfigProviderView>,
   name: string,
+  live?: string[] | null,
 ): string[] {
   const entry = providers[name];
   if (!entry) return [];
+  // Ollama only serves what the operator pulled, and every id carries a tag.
+  // The curated list is untagged guesswork, so prefer the real catalog when
+  // the daemon could read it; fall back to the guesses when it could not.
+  if (entry.kind === "ollama" && live && live.length > 0) return live;
   return MODELS_BY_KIND[entry.kind] ?? [];
+}
+
+/**
+ * Installed Ollama models, read from the daemon once per mount. `null` while
+ * in flight or when the provider isn't Ollama; `[]` when Ollama was
+ * unreachable (callers then fall back to the curated list).
+ */
+function useOllamaModels(enabled: boolean): string[] | null {
+  const [models, setModels] = useState<string[] | null>(null);
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    fetch("/api/config/llm/ollama/models")
+      .then((r) => r.json())
+      .then((d: { ok: boolean; models?: string[] }) => {
+        if (!cancelled) setModels(d.ok && d.models ? d.models : []);
+      })
+      .catch(() => {
+        if (!cancelled) setModels([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled]);
+  return models;
 }

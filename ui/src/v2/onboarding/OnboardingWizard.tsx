@@ -182,6 +182,47 @@ export function OnboardingWizard({
   // previous "Connected" verdict.
   useEffect(() => { setTest((t) => (t.status === "idle" ? t : { status: "idle" })); }, [apiKey, baseUrl, model]);
 
+  // Ollama serves only what the operator pulled, and every id carries a tag
+  // ("qwen2.5:3b"). The curated list is untagged guesswork — picking from it
+  // yields ":latest", usually not pulled, and the first chat 404s. Ask the
+  // daemon for the real catalog instead — debounced, since the base URL
+  // arrives one keystroke at a time and every probe of a half-typed host is
+  // a doomed network call. Falls back to the curated list when Ollama is
+  // unreachable (empty base URL means "let the daemon pick its default").
+  const [ollamaModels, setOllamaModels] = useState<string[] | null>(null);
+  const [ollamaLoading, setOllamaLoading] = useState(false);
+  useEffect(() => {
+    if (provId !== "ollama") return;
+    let cancelled = false;
+    setOllamaLoading(true);
+    const timer = window.setTimeout(() => {
+      fetch(`/api/config/llm/ollama/models?base_url=${encodeURIComponent(baseUrl.trim())}`)
+        .then((r) => r.json())
+        .then((d: { ok: boolean; models?: string[] }) => {
+          if (cancelled) return;
+          setOllamaModels(d.ok && d.models && d.models.length > 0 ? d.models : []);
+        })
+        .catch(() => { if (!cancelled) setOllamaModels([]); })
+        .finally(() => { if (!cancelled) setOllamaLoading(false); });
+    }, 400);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [provId, baseUrl]);
+
+  // Snap the untagged curated default to its installed sibling once the real
+  // list arrives ("qwen2.5" -> "qwen2.5:3b"), so the test button works
+  // without the user having to notice the mismatch. The model field is a
+  // strict select here, so the selection always came from a list we offered —
+  // snapping can't clobber a hand-typed id. The [apiKey, baseUrl, model]
+  // effect above resets a stale test verdict when this fires.
+  useEffect(() => {
+    if (provId !== "ollama") return;
+    if (!ollamaModels || ollamaModels.length === 0) return;
+    if (!ollamaModels.includes(model)) {
+      const sameFamily = ollamaModels.find((m) => m.split(":")[0] === model.split(":")[0]);
+      setModel(sameFamily ?? ollamaModels[0]!);
+    }
+  }, [ollamaModels, provId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // The Google OAuth poll outlives the click handler — keep its id in a ref so
   // finishing/unmounting the wizard stops it (it ran for up to 5 min after).
   const googlePollRef = useRef<number | null>(null);
@@ -662,13 +703,17 @@ export function OnboardingWizard({
 
   function renderProvDetail() {
     if (prov.noConfig) return <div className="obw-testres ok" style={{ fontSize: 12 }}><span className="dot" />Jarvis AI is included with your plan. Nothing to configure.</div>;
+    // The live Ollama catalog when we have one, the curated list otherwise.
+    const pickerModels = provId === "ollama" && ollamaModels && ollamaModels.length > 0 ? ollamaModels : (prov.models ?? []);
     return (
       <>
         {prov.needsBaseUrl && <div className="obw-field"><label>{prov.urlLabel}</label><input className="obw-inp" placeholder={prov.urlPh} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} /></div>}
         {prov.needsKey && <div className="obw-field"><label>API key</label><input className="obw-inp" type="password" placeholder="paste your key" value={apiKey} onChange={(e) => setApiKey(e.target.value)} /></div>}
         {prov.freeModel
           ? <div className="obw-field"><label>Model</label><input className="obw-inp" placeholder="model id" value={model} onChange={(e) => setModel(e.target.value)} /></div>
-          : <div className="obw-field"><label>Model</label><select className="obw-inp" value={model} onChange={(e) => setModel(e.target.value)}>{prov.models?.map((m) => <option key={m} value={m}>{m}</option>)}</select></div>}
+          : <div className="obw-field"><label>Model</label><select className="obw-inp" value={model} onChange={(e) => setModel(e.target.value)}>{pickerModels.map((m) => <option key={m} value={m}>{m}</option>)}</select></div>}
+        {provId === "ollama" && ollamaLoading && <div className="obw-hint">Reading installed models from Ollama…</div>}
+        {provId === "ollama" && !ollamaLoading && ollamaModels?.length === 0 && <div className="obw-hint">Could not reach Ollama at this URL — showing suggestions instead. Make sure Ollama is running (models must include their tag, e.g. llama3.1:8b).</div>}
         <div className="obw-testrow">
           <button className="obw-btn obw-btn-ghost sm" disabled={test.status === "testing"} onClick={runTest}>{test.status === "testing" ? "Testing…" : "Test connection"}</button>
           {test.status === "ok" && <span className="obw-testres ok"><span className="dot" />Connected · {test.msg}</span>}
