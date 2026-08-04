@@ -21,8 +21,9 @@ import type {
 } from './types.ts';
 import type { RPCRequest, RPCTimeouts, SidecarEvent, RPCResultPayload, RPCErrorPayload, RPCProgressPayload } from './protocol.ts';
 import { DEFAULT_RPC_TIMEOUTS } from './protocol.ts';
-import { EventScheduler } from './scheduler.ts';
+import { EventScheduler, type DroppedEventsStats } from './scheduler.ts';
 import { RPCTracker } from './rpc.ts';
+import { BinarySpool, type BinarySpoolStats } from './binary-spool.ts';
 import { SidecarConnection } from './connection.ts';
 import { classifySidecarVersion, SIDECAR_MIN_VERSION, SIDECAR_RECOMMENDED_VERSION } from './compat.ts';
 import { chmodWithWarning, secureDirectory, secureWriteFile } from '../util/fs-secure.ts';
@@ -84,6 +85,7 @@ export class SidecarManager implements Service {
   /** Protocol infrastructure */
   private scheduler: EventScheduler;
   private rpcTracker: RPCTracker;
+  private binarySpool: BinarySpool;
   private sidecarConnections = new Map<string, SidecarConnection>();
   private revocationSweepTimer: ReturnType<typeof setInterval> | null = null;
   private progressListeners = new Set<(sidecarId: string, rpcId: string, progress: number, message?: string) => void>();
@@ -111,6 +113,15 @@ export class SidecarManager implements Service {
     this.dataDir = dataDir;
     this.scheduler = new EventScheduler();
     this.rpcTracker = new RPCTracker();
+    this.binarySpool = new BinarySpool(dataDir);
+  }
+
+  /**
+   * Event-pressure counters: queue-overflow drops and disk-spool activity.
+   * For dashboards/health surfaces, mirroring WorkflowEventBuffer.dropped().
+   */
+  getEventStats(): { dropped: DroppedEventsStats; spool: BinarySpoolStats } {
+    return { dropped: this.scheduler.dropped(), spool: this.binarySpool.stats() };
   }
 
   /**
@@ -202,6 +213,7 @@ export class SidecarManager implements Service {
       });
 
       this.scheduler.start();
+      this.binarySpool.start();
 
       this._status = 'running';
       console.log('[SidecarManager] Started — keys loaded, scheduler running');
@@ -221,6 +233,7 @@ export class SidecarManager implements Service {
 
     // Stop scheduler
     this.scheduler.stop();
+    this.binarySpool.stop();
 
     // Close all sidecar connections and fail pending RPCs. Use WS 1001 (Going
     // Away) + reason so the sidecar recognizes a planned restart and reconnects
@@ -548,6 +561,7 @@ export class SidecarManager implements Service {
       ws,
       this.scheduler,
       () => this.handleSidecarDisconnect(sidecarId),
+      this.binarySpool,
     );
     connection.startHeartbeat();
     this.sidecarConnections.set(sidecarId, connection);

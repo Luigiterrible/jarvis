@@ -14,6 +14,7 @@ import { flushWindowState } from "./window-state.ts";
 import { ServiceRegistry } from "./services.ts";
 import { HealthMonitor } from "./health.ts";
 import { loadConfig } from "../config/loader.ts";
+import { resolveEngineIdleTtlMs } from "./config-merge.ts";
 import { activeTurns } from "./active-turns.ts";
 import { writeLockedPort } from "./pid.ts";
 import { AgentService } from "./agent-service.ts";
@@ -818,7 +819,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         if (n === 1 || n % 125 === 0) console.log(`[pebble-realtime] mic frames (audio channel) from ${sidecarId}: ${n}`);
         pebbleRealtime.pushMicChunk(sidecarId, frame);
       });
-      sidecarManager.onSidecarDisconnected((sidecarId) => pebbleRealtime.stop(sidecarId));
+      sidecarManager.onSidecarDisconnected((sidecarId) => {
+        pebbleRealtime.stop(sidecarId);
+        // Per-sidecar transient state — drop with the connection so the maps
+        // stay bounded by connected sidecars, not lifetime-distinct ones.
+        clearListenTimer(sidecarId);
+        lastTrayState.delete(sidecarId);
+        pebbleMicFrames.delete(sidecarId);
+      });
 
       // STT + TTS providers for the pebble's voice loop. Both built from
       // the same jarvisConfig.* the dashboard uses so API keys / provider
@@ -4063,6 +4071,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           },
         },
         log: (line) => console.log(`[Daemon] ${line}`),
+        engineIdleTtlMs: resolveEngineIdleTtlMs(jarvisConfig.workflows?.engineIdleTtlMs),
       });
       workflowEngineShutdown = engineBoot.shutdown;
       logWithTimestamp(
