@@ -1546,6 +1546,49 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+    // Full OmniRoute catalog: provider models, free routes, automatic routes,
+    // and user-defined combos. POST keeps an onboarding API key out of the URL
+    // and also supports a saved provider by name from Settings.
+    '/api/config/llm/omniroute/models': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as {
+            name?: string;
+            base_url?: string;
+            api_key?: string;
+          };
+          // Effective kind is `entry.kind ?? name` (see config-binding.ts) -
+          // a provider simply named "omniroute" counts too.
+          const providers = ctx.config.llm.providers ?? {};
+          const providerName = body.name
+            ?? Object.keys(providers).find((name) => (providers[name]?.kind ?? name) === 'omniroute');
+          const configured = providerName ? providers[providerName] : undefined;
+          if (body.name && (!configured || (configured.kind ?? body.name) !== 'omniroute')) {
+            return json({ ok: false, error: 'OmniRoute provider not found', models: [] });
+          }
+          const requestedBaseUrl = body.base_url?.trim();
+          const baseUrl = requestedBaseUrl || configured?.base_url?.trim() || 'http://localhost:20128/v1';
+          if (!/^https?:\/\//i.test(baseUrl)) {
+            return json({ ok: false, error: 'base_url must be an http(s) URL', models: [] });
+          }
+
+          // Saved credentials only travel to the saved base URL - a caller-typed
+          // base_url never gets the stored key attached.
+          const { getSecret } = await import('../vault/keychain.ts');
+          const storedApiKey = requestedBaseUrl
+            ? null
+            : (providerName ? getSecret(`llm.provider.${providerName}.api_key`) : null) || configured?.api_key;
+          const apiKey = body.api_key || storedApiKey || '';
+          const { OmniRouteProvider } = await import('../llm/omniroute.ts');
+          const models = await new OmniRouteProvider(baseUrl, 'auto', apiKey).listModels();
+          return json({ ok: true, models });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ ok: false, error: msg, models: [] });
+        }
+      },
+    },
+
     // --- Usage telemetry ---
     /**
      * Filterable LLM usage query. All query params are optional:

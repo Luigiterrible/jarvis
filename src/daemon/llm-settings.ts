@@ -101,6 +101,7 @@ export const AVAILABLE_KINDS: LLMProviderKind[] = [
   'nvidia',
   'openai_compatible',
   'litellm',
+  'omniroute',
 ];
 
 // ── getLLMSettings ───────────────────────────────────────────────────────
