@@ -6,7 +6,7 @@ import type { SidecarManager } from '../sidecar/manager.ts';
 
 /** Constant-time string comparison to prevent timing attacks */
 export type WSMessage = {
-  type: 'chat' | 'command' | 'status' | 'stream' | 'error' | 'notification'
+  type: 'chat' | 'cancel' | 'command' | 'status' | 'stream' | 'error' | 'notification'
       | 'tts_start' | 'tts_text' | 'tts_end' | 'voice_start' | 'voice_end' | 'voice_text'
       | 'interview_start' | 'interview_user_message' | 'interview_assistant' | 'interview_done' | 'interview_error'
       | 'thinking_start' | 'thinking_end'
@@ -472,9 +472,20 @@ export class WebSocketServer {
 
           const file = Bun.file(filePath);
           if (await file.exists()) {
-            if (!self.insecureOpenAccess && filePath.endsWith('.html')) {
-              const html = await file.text();
-              return new Response(injectTokenStrip(html), { headers: { 'Content-Type': 'text/html' } });
+            if (filePath.endsWith('.html')) {
+              // The HTML points at content-hashed JS/CSS bundles. Never let a
+              // browser or reverse proxy retain an old shell after an update,
+              // otherwise newly deployed controls (such as Stop) remain
+              // invisible even though the new bundle exists on the server.
+              const headers = {
+                'Content-Type': 'text/html',
+                'Cache-Control': 'no-store',
+              };
+              if (!self.insecureOpenAccess) {
+                const html = await file.text();
+                return new Response(injectTokenStrip(html), { headers });
+              }
+              return new Response(file, { headers });
             }
             return new Response(file);
           }

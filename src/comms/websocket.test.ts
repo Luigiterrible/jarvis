@@ -1,4 +1,7 @@
 import { test, expect, beforeEach, afterEach } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { WebSocketServer, type WSMessage } from './websocket.ts';
 
 let server: WebSocketServer;
@@ -68,6 +71,28 @@ test('WebSocketServer - root endpoint returns 404 without static dir', async () 
   expect(response.status).toBe(404);
 
   server.stop();
+});
+
+test('WebSocketServer - dashboard HTML is never cached by a reverse proxy', async () => {
+  const staticDir = mkdtempSync(path.join(tmpdir(), 'jarvis-static-'));
+  // Own port: earlier tests leave a pooled keep-alive connection to 3143
+  // whose (stopped, draining) server instance would answer this fetch with
+  // its own routing — a 404, since it had no staticDir.
+  const htmlServer = new WebSocketServer(3144);
+  htmlServer.setInsecureOpenAccess(true);
+  try {
+    await Bun.write(path.join(staticDir, 'index.html'), '<!doctype html><title>Jarvis</title>');
+    htmlServer.setStaticDir(staticDir);
+    htmlServer.start();
+
+    const response = await fetch('http://localhost:3144/');
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(response.headers.get('content-type')).toContain('text/html');
+  } finally {
+    htmlServer.stop();
+    rmSync(staticDir, { recursive: true, force: true });
+  }
 });
 
 test('WebSocketServer - WebSocket connection', async () => {

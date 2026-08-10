@@ -100,13 +100,17 @@ export type VoiceCallbacks = {
   onTTSBinary: (data: ArrayBuffer) => void;
   /** `containsWake` — true if the TTS sentence about to play contains
    *  "Jarvis". UI uses it to suppress the wake-word recognizer for the
-   *  duration of the playback so TTS doesn't self-trigger via mic echo. */
-  onTTSStart: (requestId: string, containsWake: boolean) => void;
-  /** Mid-turn flip: a later sentence in the same turn contains "Jarvis". */
-  onTTSContainsWake?: () => void;
+   *  duration of the playback so TTS doesn't self-trigger via mic echo.
+   *  `containsStop` — the sentence contains a spoken stop phrase
+   *  ("Jarvis, stop"), so the UI must also suppress its stop-phrase
+   *  bypass or the echo cancels the playback. */
+  onTTSStart: (requestId: string, containsWake: boolean, containsStop?: boolean) => void;
+  /** Mid-turn flip: a later sentence in the same turn contains "Jarvis"
+   *  (and possibly a stop phrase). */
+  onTTSContainsWake?: (containsStop?: boolean) => void;
   /** `bargeIn` — realtime voice sends tts_end{bargeIn:true} when the user
    *  starts speaking, so the player can flush queued output immediately. */
-  onTTSEnd: (bargeIn?: boolean) => void;
+  onTTSEnd: (requestId?: string, bargeIn?: boolean) => void;
   onError: (message?: string) => void;
   /** Realtime session ended server-side (max_session_minutes timeout or
    *  server close). The client must stop the mic — it's otherwise streaming
@@ -381,6 +385,7 @@ export function useWebSocket() {
   const [clarifiers, setClarifiers] = useState<PendingClarifier[]>([]);
   const [repeatBacks, setRepeatBacks] = useState<PendingRepeatBack[]>([]);
   const [thinking, setThinking] = useState(false);
+  const [isResponding, setIsResponding] = useState(false);
   const [roomNavRequest, setRoomNavRequest] = useState<{ key: string; ts: number } | null>(null);
   const [windowControlRequest, setWindowControlRequest] = useState<{
     action: "close" | "minimize" | "expand" | "restore" | "reorder";
@@ -401,6 +406,8 @@ export function useWebSocket() {
   const subAgentEventsRef = useRef<SubAgentEvent[]>([]);
   const voiceCallbacksRef = useRef<VoiceCallbacks | null>(null);
   const pendingChatIdsRef = useRef<Set<string>>(new Set());
+  /** Request whose chunks currently own the single foreground composer turn. */
+  const currentChatRequestIdRef = useRef<string | null>(null);
 
   const connect = useCallback(() => {
     // A manual "Retry now" or the scheduled backoff can fire while a socket is
@@ -474,6 +481,8 @@ export function useWebSocket() {
 
     ws.onclose = () => {
       setIsConnected(false);
+      setIsResponding(false);
+      currentChatRequestIdRef.current = null;
       console.log("[WS] Disconnected, reconnecting in 2s...");
       reconnectTimerRef.current = setTimeout(connect, 2000);
     };
@@ -497,6 +506,7 @@ export function useWebSocket() {
           voiceCallbacksRef.current?.onTTSStart(
             msg.payload?.requestId,
             Boolean(msg.payload?.containsWake),
+            Boolean(msg.payload?.containsStop),
           );
           setThinking(false); // speaking supersedes thinking
           return;
@@ -506,12 +516,17 @@ export function useWebSocket() {
           // UI must suppress the wake recognizer so TTS playback doesn't
           // self-trigger.
           if (msg.payload?.containsWake) {
-            voiceCallbacksRef.current?.onTTSContainsWake?.();
+            voiceCallbacksRef.current?.onTTSContainsWake?.(
+              Boolean(msg.payload?.containsStop),
+            );
           }
           return;
         }
         if (msg.type === "tts_end") {
-          voiceCallbacksRef.current?.onTTSEnd(Boolean(msg.payload?.bargeIn));
+          voiceCallbacksRef.current?.onTTSEnd(
+            msg.payload?.requestId,
+            Boolean(msg.payload?.bargeIn),
+          );
           return;
         }
         // Premium realtime voice (gpt-realtime-2) status + live captions.
@@ -552,10 +567,30 @@ export function useWebSocket() {
           return;
         }
         if (msg.type === "thinking_start") {
+          // thinking_start is a broadcast (voice pipeline), so it can arrive
+          // for a turn other than the one this client owns. Never overwrite
+          // an active turn's id — a stale broadcast would make the gate drop
+          // the active response's stream chunks and strand the composer in
+          // its Stop state.
+          if (
+            currentChatRequestIdRef.current
+            && msg.id
+            && msg.id !== currentChatRequestIdRef.current
+          ) return;
           setThinking(true);
+          setIsResponding(true);
+          if (msg.id && !currentChatRequestIdRef.current) {
+            currentChatRequestIdRef.current = msg.id;
+          }
           return;
         }
         if (msg.type === "thinking_end") {
+          const requestId = String(msg.payload?.requestId ?? msg.id ?? "");
+          if (
+            currentChatRequestIdRef.current
+            && requestId
+            && requestId !== currentChatRequestIdRef.current
+          ) return;
           setThinking(false);
           return;
         }
@@ -599,6 +634,14 @@ export function useWebSocket() {
         },
       ]);
     } else if (msg.type === "stream") {
+      const requestId = String(msg.payload?.requestId ?? msg.id ?? "");
+      const currentRequestId = currentChatRequestIdRef.current;
+      // A cancelled/superseded provider can deliver one final network chunk
+      // while its async iterator unwinds. Never append it to the replacement
+      // response (the old single-buffer behavior caused overlapping answers).
+      if (currentRequestId && requestId && requestId !== currentRequestId) return;
+      if (!currentRequestId && requestId) currentChatRequestIdRef.current = requestId;
+      setIsResponding(true);
       if (msg.payload?.source === "sub-agent") {
         // Sub-agent progress event
         const event: SubAgentEvent = {
@@ -677,8 +720,18 @@ export function useWebSocket() {
           );
         }
       }
-    } else if (msg.type === "status" && msg.payload?.status === "done") {
-      // Stream complete
+    } else if (
+      msg.type === "status"
+      && (msg.payload?.status === "done" || msg.payload?.status === "cancelled")
+    ) {
+      const requestId = String(msg.payload?.requestId ?? msg.id ?? "");
+      if (
+        currentChatRequestIdRef.current
+        && requestId
+        && requestId !== currentChatRequestIdRef.current
+      ) return;
+      // Stream complete or explicitly stopped. Keep partial text visible but
+      // remove its speaking/streaming state immediately.
       if (streamIdRef.current) {
         const finalId = streamIdRef.current;
         const finalToolCalls = toolCallsRef.current;
@@ -707,6 +760,9 @@ export function useWebSocket() {
       subAgentEventsRef.current = [];
       // A successful completion ends any in-flight chat request correlation.
       pendingChatIdsRef.current.clear();
+      currentChatRequestIdRef.current = null;
+      setIsResponding(false);
+      setThinking(false);
     } else if (msg.type === "goal_event") {
       const goalEvent = msg.payload as GoalEvent;
       setGoalEvents((prev) => [...prev.slice(-100), goalEvent]);
@@ -957,6 +1013,9 @@ export function useWebSocket() {
       streamIdRef.current = null;
       toolCallsRef.current = [];
       subAgentEventsRef.current = [];
+      currentChatRequestIdRef.current = null;
+      setIsResponding(false);
+      setThinking(false);
     }
   }, []);
 
@@ -973,11 +1032,48 @@ export function useWebSocket() {
     };
   }, [connect]);
 
+  const cancelResponse = useCallback(() => {
+    const requestId = currentChatRequestIdRef.current;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "cancel",
+        payload: requestId ? { requestId } : {},
+        id: requestId ?? undefined,
+        timestamp: Date.now(),
+      }));
+    }
+
+    if (streamIdRef.current) {
+      const finalId = streamIdRef.current;
+      setMessages((prev) => prev.map((message) =>
+        message.id === finalId ? { ...message, isStreaming: false } : message
+      ));
+    }
+    streamBufferRef.current = "";
+    streamIdRef.current = null;
+    toolCallsRef.current = [];
+    subAgentEventsRef.current = [];
+    pendingChatIdsRef.current.clear();
+    currentChatRequestIdRef.current = null;
+    setThinking(false);
+    setIsResponding(false);
+  }, []);
+
   const sendMessage = useCallback(
     (text: string, options?: { projectId?: string; currentRoom?: string }) => {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
+      // Typed barge-in: the replacement turn owns the composer immediately.
+      // The daemon also enforces this, but doing it here prevents even a single
+      // late chunk from the old request flashing into the new response. The ref
+      // is set before isResponding in every path, so it alone is a sufficient
+      // (and render-stable) guard.
+      if (currentChatRequestIdRef.current) cancelResponse();
+
       const id = uuid();
+      currentChatRequestIdRef.current = id;
+      setIsResponding(true);
 
       // Add user message to local state
       setMessages((prev) => [
@@ -1024,7 +1120,7 @@ export function useWebSocket() {
         setNotices((prev) => [notice, ...prev.filter((item) => item.text !== notice.text)].slice(0, 3));
       }
     },
-    []
+    [cancelResponse]
   );
 
   const dismissNotice = useCallback((noticeId: string) => {
@@ -1032,7 +1128,7 @@ export function useWebSocket() {
   }, []);
 
   return {
-    messages, isConnected, sendMessage, taskEvents, contentEvents, agentActivity, workflowEvents, goalEvents, siteEvents, settingsEvents, notices, dismissNotice,
+    messages, isConnected, sendMessage, cancelResponse, isResponding, taskEvents, contentEvents, agentActivity, workflowEvents, goalEvents, siteEvents, settingsEvents, notices, dismissNotice,
     approvals,
     clarifiers,
     repeatBacks,
