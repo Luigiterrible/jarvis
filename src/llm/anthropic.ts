@@ -109,21 +109,44 @@ type AnthropicSystemBlock = {
   cache_control?: { type: 'ephemeral' };
 };
 
+export function anthropicMessagesUrl(baseUrl?: string): string {
+  if (!baseUrl?.trim()) return 'https://api.anthropic.com/v1/messages';
+  const normalized = baseUrl.trim().replace(/\/+$/, '');
+  if (normalized.endsWith('/v1/messages')) return normalized;
+  if (normalized.endsWith('/v1')) return `${normalized}/messages`;
+  return `${normalized}/v1/messages`;
+}
+
+/** The public Anthropic origin still uses x-api-key even when typed explicitly. */
+export function isAnthropicCustomBaseUrl(baseUrl?: string): boolean {
+  if (!baseUrl?.trim()) return false;
+  try {
+    return new URL(baseUrl.trim()).origin !== 'https://api.anthropic.com';
+  } catch {
+    // Let fetch surface the malformed URL; never treat it as Anthropic's
+    // trusted origin for credential/header selection.
+    return true;
+  }
+}
+
 export class AnthropicProvider implements LLMProvider {
   name = 'anthropic';
   private apiKey: string;
   private defaultModel: string;
   private promptCache: boolean;
-  private apiUrl = 'https://api.anthropic.com/v1/messages';
+  private apiUrl: string;
+  private bearerAuth: boolean;
 
   constructor(
     apiKey: string,
     defaultModel = 'claude-sonnet-4-5-20250929',
-    opts?: { promptCache?: boolean },
+    opts?: { promptCache?: boolean; baseUrl?: string },
   ) {
     this.apiKey = apiKey;
     this.defaultModel = defaultModel;
     this.promptCache = opts?.promptCache !== false;
+    this.apiUrl = anthropicMessagesUrl(opts?.baseUrl);
+    this.bearerAuth = isAnthropicCustomBaseUrl(opts?.baseUrl);
   }
 
   /**
@@ -131,10 +154,11 @@ export class AnthropicProvider implements LLMProvider {
    */
   private async fetchWithRetry(body: string, stream: boolean = false): Promise<Response> {
     const headers: Record<string, string> = {
-      'x-api-key': this.apiKey,
       'anthropic-version': '2023-06-01',
       'content-type': 'application/json',
     };
+    if (this.bearerAuth) headers.authorization = `Bearer ${this.apiKey}`;
+    else headers['x-api-key'] = this.apiKey;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       const response = await fetch(this.apiUrl, {
@@ -348,10 +372,7 @@ export class AnthropicProvider implements LLMProvider {
   }
 
   async listModels(): Promise<string[]> {
-    // Anthropic doesn't have a models endpoint, so return known models
-    // (current family first). Keep in sync with the UI model pickers in
-    // ui/src/v2/rooms/settings/tabs/LLMTab.tsx + the onboarding wizard.
-    return [
+    const knownModels = [
       'claude-fable-5',
       'claude-opus-4-8',
       'claude-sonnet-5',
@@ -359,6 +380,26 @@ export class AnthropicProvider implements LLMProvider {
       'claude-sonnet-4-6',
       'claude-haiku-4-5-20251001',
     ];
+    if (!this.bearerAuth) return knownModels;
+
+    try {
+      const response = await fetch(this.apiUrl.replace(/\/messages$/, '/models'), {
+        headers: {
+          authorization: `Bearer ${this.apiKey}`,
+          'anthropic-version': '2023-06-01',
+        },
+      });
+      if (!response.ok) return [];
+      const payload = await response.json() as { data?: Array<{ id?: unknown }> };
+      const models = payload.data
+        ?.map((entry) => entry.id)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0);
+      // Keep the gateway's own ordering: its first entry is the closest
+      // thing to a recommended default we have.
+      return models?.length ? [...new Set(models)] : [];
+    } catch {
+      return [];
+    }
   }
 
   private convertMessages(messages: LLMMessage[]): {

@@ -25,6 +25,7 @@ import {
   atomicReloadProviders,
   configureLLMTiers,
 } from '../llm/config-binding.ts';
+import { isAnthropicCustomBaseUrl } from '../llm/anthropic.ts';
 
 // ── DB keys ──────────────────────────────────────────────────────────────
 const SETTING_PROVIDERS = 'llm.providers';
@@ -39,6 +40,10 @@ const SETTING_PROMPT_CACHE = 'llm.prompt_cache';
 /** Keychain key for a provider's API key, by provider NAME (not kind). */
 function keychainKey(providerName: string): string {
   return `llm.provider.${providerName}.api_key`;
+}
+
+function normalizeBaseUrl(value: string | undefined): string {
+  return value?.trim().replace(/\/+$/, '') ?? '';
 }
 
 // ── Types exposed to the dashboard ───────────────────────────────────────
@@ -163,7 +168,41 @@ export function saveLLMSettings(
 
   // Apply provider updates (add / modify / remove).
   if (body.providers) {
-    for (const [name, update] of Object.entries(body.providers)) {
+    const updates = Object.entries(body.providers);
+    // Validate every update before mutating anything: a rejection mid-loop
+    // would otherwise leave earlier entries applied in memory but never
+    // persisted by the setSetting() block at the end of this function.
+    for (const [name, update] of updates) {
+      if (update === null) continue;
+      const existing = config.llm.providers[name] ?? {};
+      const nextBaseUrl = normalizeBaseUrl(update.base_url);
+      const existingBaseUrl = normalizeBaseUrl(existing.base_url);
+      const retainsStoredCredential = update.api_key === undefined
+        && (Boolean(existing.api_key) || hasSecret(keychainKey(name)));
+      // A stored credential is scoped to its saved endpoint in BOTH
+      // directions: it must not follow the provider to a new gateway, and a
+      // gateway token must not be replayed against the official endpoint
+      // after the URL is cleared. Any base_url move requires the credential
+      // again in the same request.
+      if (
+        update.base_url !== undefined
+        && nextBaseUrl !== existingBaseUrl
+        && retainsStoredCredential
+      ) {
+        throw new Error(`Provider '${name}' requires the API key or auth token again when changing base_url`);
+      }
+      // `kind` selects an endpoint just like base_url does — switching it
+      // would replay the stored credential against another provider's API.
+      // (Legacy entries without an explicit kind are keyed by their name.)
+      if (
+        update.kind !== undefined
+        && update.kind !== (existing.kind ?? name)
+        && retainsStoredCredential
+      ) {
+        throw new Error(`Provider '${name}' requires the API key or auth token again when changing kind`);
+      }
+    }
+    for (const [name, update] of updates) {
       if (update === null) {
         delete config.llm.providers[name];
         try { deleteSecret(keychainKey(name)); } catch { /* ignore */ }
@@ -447,7 +486,7 @@ export async function testLLMProvider(
     model?: string;
   },
   config: JarvisConfig,
-): Promise<{ ok: boolean; model?: string; error?: string }> {
+): Promise<{ ok: boolean; model?: string; models?: string[]; error?: string }> {
   // Resolve effective name + kind. Legacy `provider` is treated as `name`.
   const name = opts.name ?? opts.provider ?? opts.kind;
   if (!name) return { ok: false, error: 'provider name required' };
@@ -456,9 +495,43 @@ export async function testLLMProvider(
   const configured = config.llm.providers?.[name];
   const kind: LLMProviderKind = (opts.kind ?? configured?.kind ?? name) as LLMProviderKind;
 
-  // Resolve credentials: explicit > keychain > config inline.
-  const apiKey = opts.api_key ?? getSecret(keychainKey(name)) ?? configured?.api_key ?? '';
-  const baseUrl = opts.base_url ?? configured?.base_url ?? '';
+  const hasExplicitBaseUrl = Object.hasOwn(opts, 'base_url');
+  const requestedBaseUrl = opts.base_url?.trim() ?? '';
+  const configuredBaseUrl = configured?.base_url?.trim() ?? '';
+  const storedApiKey = getSecret(keychainKey(name)) ?? configured?.api_key ?? '';
+  const normalizedRequestedBaseUrl = normalizeBaseUrl(requestedBaseUrl);
+  const normalizedConfiguredBaseUrl = normalizeBaseUrl(configuredBaseUrl);
+
+  // A stored credential is scoped to its saved endpoint, in both directions:
+  // never attach it to a caller-supplied URL, and never replay a gateway
+  // token against the official endpoint after the URL is cleared. Moving the
+  // endpoint anywhere requires the credential again in the same request.
+  if (
+    hasExplicitBaseUrl
+    && normalizedRequestedBaseUrl !== normalizedConfiguredBaseUrl
+    && storedApiKey
+    && !opts.api_key
+  ) {
+    return { ok: false, error: 'Changing base_url requires an explicit api_key or auth token' };
+  }
+
+  // `kind` selects an endpoint just like base_url does — an overridden kind
+  // would replay the stored credential against another provider's API (some
+  // kinds don't even need a base_url to reach one, e.g. their default
+  // origin). Legacy entries without an explicit kind are keyed by name.
+  if (
+    opts.kind !== undefined
+    && opts.kind !== (configured?.kind ?? name)
+    && storedApiKey
+    && !opts.api_key
+  ) {
+    return { ok: false, error: 'Changing the provider kind requires an explicit api_key or auth token' };
+  }
+
+  // Resolve credentials: explicit > keychain > config inline. Preserve an
+  // explicit empty base_url instead of falling back to the stored gateway.
+  const apiKey = opts.api_key ?? storedApiKey;
+  const baseUrl = hasExplicitBaseUrl ? requestedBaseUrl : configuredBaseUrl;
 
   const entry: LLMProviderEntry = {
     kind,
@@ -472,11 +545,20 @@ export async function testLLMProvider(
   }
 
   try {
+    let models: string[] | undefined;
+    let testModel = opts.model;
+    if (kind === 'anthropic' && isAnthropicCustomBaseUrl(baseUrl) && !testModel) {
+      models = await instance.listModels().catch(() => []);
+      if (!models.length) {
+        return { ok: false, error: 'Could not discover any models from the custom Anthropic endpoint' };
+      }
+      testModel = models[0];
+    }
     const resp = await instance.chat(
       [{ role: 'user', content: 'Say OK' }],
-      { max_tokens: 5, ...(opts.model ? { model: opts.model } : {}) },
+      { max_tokens: 5, ...(testModel ? { model: testModel } : {}) },
     );
-    return { ok: true, model: resp.model };
+    return { ok: true, model: testModel ?? resp.model, ...(models ? { models } : {}) };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }

@@ -7,6 +7,7 @@ import {
   LLM_PROVIDER_KIND_LABELS,
   LLM_PROVIDER_KINDS,
   OPTIONAL_KEY_KINDS,
+  OPTIONAL_BASE_URL_KINDS,
   URL_BASED_KINDS,
   type LLMConfigProviderView,
   type LLMProviderKind,
@@ -299,6 +300,9 @@ function ProvidersList({
   );
 }
 
+/** Match the daemon's base_url comparison: trim plus trailing-slash strip. */
+const normalizeBaseUrl = (value: string) => value.trim().replace(/\/+$/, "");
+
 function ProviderRow({
   name,
   entry,
@@ -315,22 +319,38 @@ function ProviderRow({
   onToggleExpanded: () => void;
 }) {
   const usesUrl = URL_BASED_KINDS.has(entry.kind);
+  const optionalUrl = OPTIONAL_BASE_URL_KINDS.has(entry.kind);
   const usesKey = KEY_BASED_KINDS.has(entry.kind);
   const needsKey = usesKey && !OPTIONAL_KEY_KINDS.has(entry.kind);
   const configured = (!usesUrl || !!entry.base_url?.trim()) && (!needsKey || entry.has_api_key);
 
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(entry.base_url ?? "");
+  const [customEndpoint, setCustomEndpoint] = useState(optionalUrl && Boolean(entry.base_url));
+  const supportsUrl = usesUrl || (optionalUrl && customEndpoint);
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [testResult, setTestResult] = useState<{ ok: boolean; text: string; models?: string[] } | null>(null);
+  // The daemon scopes a stored credential to its saved endpoint and refuses
+  // any base_url move without the credential re-entered — including a revert
+  // to the official endpoint. Mirror that rule here so the user is told
+  // before Test/Save bounce off it.
+  const effectiveBaseUrl = supportsUrl ? normalizeBaseUrl(baseUrl) : "";
+  const endpointChanged = (usesUrl || optionalUrl)
+    && entry.has_api_key
+    && effectiveBaseUrl !== normalizeBaseUrl(entry.base_url ?? "");
 
   useEffect(() => {
     setBaseUrl(entry.base_url ?? "");
-  }, [entry.base_url]);
+    setCustomEndpoint(optionalUrl && Boolean(entry.base_url));
+  }, [entry.base_url, optionalUrl]);
+
+  // A test verdict describes the inputs it ran with — editing any of them
+  // invalidates it (mirrors the onboarding wizard).
+  useEffect(() => { setTestResult(null); }, [apiKey, baseUrl, customEndpoint]);
 
   return (
-    <div className={"v2-set__row " + (expanded ? "v2-set__row--open" : "")}>
+    <div className={"v2-set__provider-row " + (expanded ? "v2-set__provider-row--open" : "")}>
       <button
         type="button"
         className="v2-set__row-head"
@@ -356,7 +376,9 @@ function ProviderRow({
         <div className="v2-set__row-body">
           {usesKey && (
             <div className="v2-set__field">
-              <label className="v2-set__field-label">API key{needsKey ? "" : " (optional)"}</label>
+              <label className="v2-set__field-label">
+                {entry.kind === "anthropic" && customEndpoint ? "Auth token" : `API key${needsKey ? "" : " (optional)"}`}
+              </label>
               <input
                 type="password"
                 className="v2-set__input"
@@ -366,16 +388,40 @@ function ProviderRow({
               />
             </div>
           )}
-          {usesUrl && (
+          {optionalUrl && (
+            <label className="v2-set__toggle-row">
+              <button
+                type="button"
+                className="v2-set__toggle"
+                data-checked={customEndpoint}
+                aria-checked={customEndpoint}
+                role="switch"
+                onClick={() => {
+                  setCustomEndpoint((enabled) => !enabled);
+                  setBaseUrl("");
+                  setTestResult(null);
+                }}
+              />
+              <span>Use a custom Anthropic endpoint</span>
+            </label>
+          )}
+          {supportsUrl && (
             <div className="v2-set__field">
-              <label className="v2-set__field-label">Base URL</label>
+              <label className="v2-set__field-label">
+                {optionalUrl ? "Custom endpoint URL" : "Base URL"}
+              </label>
               <input
                 type="text"
                 className="v2-set__input"
-                placeholder={DEFAULT_BASE_URLS[entry.kind] ?? "https://gateway.example/v1"}
+                placeholder={entry.kind === "anthropic" ? "https://gateway.example.com" : (DEFAULT_BASE_URLS[entry.kind] ?? "https://gateway.example/v1")}
                 value={baseUrl}
                 onChange={(e) => setBaseUrl(e.target.value)}
               />
+              {entry.kind === "anthropic" && (
+                <div className="v2-set__hint">
+                  Jarvis appends /v1/messages and authenticates with the token above.
+                </div>
+              )}
             </div>
           )}
 
@@ -383,16 +429,20 @@ function ProviderRow({
             <button
               type="button"
               className="v2-set__btn"
-              disabled={testing}
+              disabled={testing
+                || (customEndpoint && !baseUrl.trim())
+                || (endpointChanged && !apiKey)}
               onClick={async () => {
                 setTesting(true);
                 setTestResult(null);
                 const r = await data.testProvider(name, {
                   kind: entry.kind,
                   apiKey: apiKey || undefined,
-                  baseUrl: baseUrl || undefined,
+                  baseUrl: optionalUrl
+                    ? (customEndpoint ? baseUrl : "")
+                    : (baseUrl || undefined),
                 });
-                setTestResult({ ok: r.ok, text: r.message });
+                setTestResult({ ok: r.ok, text: r.message, models: r.models });
                 setTesting(false);
               }}
             >
@@ -401,12 +451,15 @@ function ProviderRow({
             <button
               type="button"
               className="v2-set__btn v2-set__btn--primary"
-              disabled={saving || (!apiKey && baseUrl === (entry.base_url ?? ""))}
+              disabled={saving
+                || (customEndpoint && !baseUrl.trim())
+                || (endpointChanged && !apiKey)
+                || (!apiKey && baseUrl === (entry.base_url ?? ""))}
               onClick={async () => {
                 setSaving(true);
                 const input: { kind?: LLMProviderKind; api_key?: string; base_url?: string } = {};
                 if (apiKey) input.api_key = apiKey;
-                if (usesUrl) input.base_url = baseUrl;
+                if (usesUrl || optionalUrl) input.base_url = supportsUrl ? baseUrl : "";
                 const r = await data.upsertProvider(name, input);
                 onToast(r.message, r.ok ? "ok" : "warn");
                 if (r.ok) setApiKey("");
@@ -429,11 +482,13 @@ function ProviderRow({
             </button>
           </div>
 
-          {testResult && (
-            <div className={"v2-set__hint " + (testResult.ok ? "v2-set__hint--ok" : "v2-set__hint--warn")}>
-              {testResult.text}
+          {endpointChanged && !apiKey && (
+            <div className="v2-set__hint v2-set__hint--warn">
+              Enter the API key or auth token again before testing or saving a changed endpoint URL.
             </div>
           )}
+
+          {testResult && <ProviderTestResult result={testResult} />}
         </div>
       )}
     </div>
@@ -455,9 +510,14 @@ function NewProviderRow({
   const [kind, setKind] = useState<LLMProviderKind>("anthropic");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
+  const [customEndpoint, setCustomEndpoint] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; text: string; models?: string[] } | null>(null);
   const [saving, setSaving] = useState(false);
 
   const usesUrl = URL_BASED_KINDS.has(kind);
+  const optionalUrl = OPTIONAL_BASE_URL_KINDS.has(kind);
+  const supportsUrl = usesUrl || (optionalUrl && customEndpoint);
   const usesKey = KEY_BASED_KINDS.has(kind);
   const needsKey = usesKey && !OPTIONAL_KEY_KINDS.has(kind);
   // Suggest name = kind unless user typed something
@@ -465,26 +525,28 @@ function NewProviderRow({
   const duplicate = existing.includes(effectiveName);
 
   return (
-    <div className="v2-set__row v2-set__row--open">
+    <div className="v2-set__provider-row v2-set__provider-row--open">
       <div className="v2-set__row-body">
-        <div className="v2-set__field">
-          <label className="v2-set__field-label">Provider kind</label>
-          <select
-            className="v2-set__select"
-            value={kind}
-            onChange={(e) => {
-              const next = e.target.value as LLMProviderKind;
-              setKind(next);
-              setBaseUrl(DEFAULT_BASE_URLS[next] ?? "");
-            }}
-          >
-            {LLM_PROVIDER_KINDS.map((k) => (
-              <option key={k} value={k}>
-                {LLM_PROVIDER_KIND_LABELS[k]}
-              </option>
-            ))}
-          </select>
-        </div>
+        <div className="v2-set__provider-grid">
+          <div className="v2-set__field">
+            <label className="v2-set__field-label">Provider kind</label>
+            <select
+              className="v2-set__select"
+              value={kind}
+              onChange={(e) => {
+                setKind(e.target.value as LLMProviderKind);
+                setBaseUrl("");
+                setCustomEndpoint(false);
+                setTestResult(null);
+              }}
+            >
+              {LLM_PROVIDER_KINDS.map((k) => (
+                <option key={k} value={k}>
+                  {LLM_PROVIDER_KIND_LABELS[k]}
+                </option>
+              ))}
+            </select>
+          </div>
 
         <div className="v2-set__field">
           <label className="v2-set__field-label">
@@ -504,9 +566,29 @@ function NewProviderRow({
           )}
         </div>
 
+        {optionalUrl && (
+          <label className="v2-set__toggle-row v2-set__provider-grid-wide">
+            <button
+              type="button"
+              className="v2-set__toggle"
+              data-checked={customEndpoint}
+              aria-checked={customEndpoint}
+              role="switch"
+              onClick={() => {
+                setCustomEndpoint((enabled) => !enabled);
+                setBaseUrl("");
+                setTestResult(null);
+              }}
+            />
+            <span>Use a custom Anthropic endpoint</span>
+          </label>
+        )}
+
         {usesKey && (
           <div className="v2-set__field">
-            <label className="v2-set__field-label">API key{needsKey ? "" : " (optional)"}</label>
+            <label className="v2-set__field-label">
+              {kind === "anthropic" && customEndpoint ? "Auth token" : `API key${needsKey ? "" : " (optional)"}`}
+            </label>
             <input
               type="password"
               className="v2-set__input"
@@ -515,18 +597,26 @@ function NewProviderRow({
             />
           </div>
         )}
-        {usesUrl && (
+        {supportsUrl && (
           <div className="v2-set__field">
-            <label className="v2-set__field-label">Base URL</label>
+            <label className="v2-set__field-label">
+              {optionalUrl ? "Custom endpoint URL" : "Base URL"}
+            </label>
             <input
               type="text"
               className="v2-set__input"
-              placeholder={DEFAULT_BASE_URLS[kind] ?? "https://gateway.example/v1"}
+              placeholder={kind === "anthropic" ? "https://gateway.example.com" : (DEFAULT_BASE_URLS[kind] ?? "https://gateway.example/v1")}
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
             />
+            {kind === "anthropic" && (
+              <div className="v2-set__hint">
+                Jarvis appends /v1/messages and authenticates with the token above.
+              </div>
+            )}
           </div>
         )}
+        </div>
 
         <div className="v2-set__row-actions" style={{ display: "flex", gap: "var(--s-2)", marginTop: "var(--s-3)" }}>
           <button type="button" className="v2-set__btn" onClick={onDone}>
@@ -534,8 +624,26 @@ function NewProviderRow({
           </button>
           <button
             type="button"
+            className="v2-set__btn"
+            disabled={testing || duplicate || (usesKey && !apiKey) || (usesUrl && !baseUrl) || (customEndpoint && !baseUrl)}
+            onClick={async () => {
+              setTesting(true);
+              setTestResult(null);
+              const result = await data.testProvider(effectiveName, {
+                kind,
+                apiKey: apiKey || undefined,
+                baseUrl: supportsUrl ? baseUrl || undefined : undefined,
+              });
+              setTestResult({ ok: result.ok, text: result.message, models: result.models });
+              setTesting(false);
+            }}
+          >
+            {testing ? "Testing…" : "Test connection"}
+          </button>
+          <button
+            type="button"
             className="v2-set__btn v2-set__btn--primary"
-            disabled={saving || duplicate || (needsKey && !apiKey) || (usesUrl && !baseUrl)}
+            disabled={saving || duplicate || (needsKey && !apiKey) || (usesUrl && !baseUrl) || (customEndpoint && !baseUrl)}
             onClick={async () => {
               setSaving(true);
               const input: { kind: LLMProviderKind; api_key?: string; base_url?: string } = { kind };
@@ -550,7 +658,29 @@ function NewProviderRow({
             {saving ? "Saving…" : "Add"}
           </button>
         </div>
+        {testResult && (
+          <ProviderTestResult result={testResult} />
+        )}
       </div>
+    </div>
+  );
+}
+
+function ProviderTestResult({
+  result,
+}: {
+  result: { ok: boolean; text: string; models?: string[] };
+}) {
+  return (
+    <div className={"v2-set__provider-test " + (result.ok ? "v2-set__provider-test--ok" : "v2-set__provider-test--warn")}>
+      <div>{result.text}</div>
+      {result.ok && result.models && result.models.length > 0 && (
+        <div className="v2-set__provider-models" aria-label="Models discovered">
+          {result.models.map((model) => (
+            <span className="v2-set__chip" key={model}>{model}</span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
