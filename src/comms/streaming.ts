@@ -9,9 +9,18 @@ export type RelayOptions = {
   onTextDone?: () => void;
   /** Stops relaying immediately when the owning client cancels/supersedes the turn. */
   signal?: AbortSignal;
+  /** Called once, immediately before the first visible text chunk is relayed. */
+  onTextStart?: () => void;
 };
 
-// Sentence boundary: period, exclamation, question mark, colon followed by whitespace or end
+// Sentence boundary: period, exclamation, question mark, colon followed by
+// whitespace or end.
+//
+// The terminator must be followed by whitespace, NOT by end-of-buffer: this
+// buffer holds a partial token stream, so "end of what has arrived" is not end
+// of sentence. Treating it as one splits "Version 1.5" into "Version 1." /
+// "5" whenever a chunk happens to end on the period. A producer that knows its
+// text is complete says so with `segmentEnd` instead.
 const SENTENCE_END_RE = /[.!?:]\s/;
 
 export class StreamRelay {
@@ -34,12 +43,19 @@ export class StreamRelay {
     let fullText = '';
     let sentenceBuffer = '';
     let streamError: string | null = null;
+    let textStarted = false;
 
     try {
       for await (const event of stream) {
         if (options?.signal?.aborted) break;
         if (event.type === 'text') {
-          fullText += event.text;
+          if (event.text) {
+            if (!textStarted) {
+              textStarted = true;
+              options?.onTextStart?.();
+            }
+            fullText += event.text;
+          }
 
           // Sentence-level TTS callback
           if (options?.onSentence) {
@@ -54,7 +70,18 @@ export class StreamRelay {
               }
               sentenceBuffer = sentenceBuffer.slice(end);
             }
+            // The producer says this text is a finished unit (an acknowledgment
+            // ahead of slow tool work), so speak it now rather than waiting for
+            // the next segment or the end of the stream.
+            if (event.segmentEnd && sentenceBuffer.trim()) {
+              options.onSentence(sentenceBuffer.trim());
+              sentenceBuffer = '';
+            }
           }
+
+          // An empty text event carries only the segmentEnd signal — there is
+          // nothing for clients to render.
+          if (!event.text) continue;
 
           // Broadcast chunk to all connected clients
           const message: WSMessage = {

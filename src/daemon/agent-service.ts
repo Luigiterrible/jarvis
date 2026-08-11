@@ -9,7 +9,7 @@
 import { join } from 'node:path';
 import type { Service, ServiceStatus } from './services.ts';
 import type { JarvisConfig } from '../config/types.ts';
-import type { LLMStreamEvent, LLMMessage } from '../llm/provider.ts';
+import type { LLMStreamEvent, LLMMessage, LLMErrorCode } from '../llm/provider.ts';
 import type { RoleDefinition } from '../roles/types.ts';
 import type { PersonalityModel } from '../personality/model.ts';
 
@@ -366,9 +366,12 @@ export class AgentService implements Service, IAgentService {
           if (event.type === 'text') {
             // Insert a separator so the acknowledgment text doesn't blur into
             // the later verbalization on the client side.
-            const chunk = (fullText && !fullText.endsWith('\n') ? '\n\n' : '') + event.text;
+            const separator = event.newSegment && fullText && !fullText.endsWith('\n') ? '\n\n' : '';
+            const chunk = separator + event.text;
             fullText += chunk;
-            yield { type: 'text', text: chunk };
+            // A segmentEnd-only event has no text; forward the signal so TTS
+            // can speak the finished acknowledgment without waiting.
+            yield { type: 'text', text: chunk, segmentEnd: event.segmentEnd };
           }
           // 'done' is implicit - the generator ends.
         }
@@ -385,8 +388,11 @@ export class AgentService implements Service, IAgentService {
         };
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
+        const code = err && typeof err === 'object'
+          ? (err as { code?: LLMErrorCode }).code
+          : undefined;
         console.error('[AgentService] Conv stream error:', errorMsg);
-        yield { type: 'error', error: errorMsg };
+        yield { type: 'error', error: errorMsg, code };
       }
     })();
 

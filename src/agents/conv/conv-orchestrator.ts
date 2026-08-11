@@ -20,8 +20,10 @@
  */
 
 import type { LLMManager } from '../../llm/manager.ts';
-import type { LLMMessage, LLMToolCall } from '../../llm/provider.ts';
+import type { LLMMessage, LLMResponse, LLMToolCall } from '../../llm/provider.ts';
+import { progressAcknowledgement } from '../progress.ts';
 import { CONV_TOOLS, CONV_TOOL_NAMES } from './conv-tools.ts';
+import { recoverSerializedConvTools, visibleStreamText } from './conv-tool-recovery.ts';
 import { TaskDispatcher } from './task-dispatcher.ts';
 import { TaskRegistry } from './task-registry.ts';
 import type { TaskRecord, TaskRequest, TaskResultEnvelope } from './task-envelope.ts';
@@ -62,7 +64,7 @@ export type ConvProcessResult = {
  * user immediately, instead of waiting for the slow task tier to finish.
  */
 export type ConvStreamEvent =
-  | { type: 'text'; text: string }
+  | { type: 'text'; text: string; newSegment?: boolean; segmentEnd?: boolean }
   | { type: 'task'; event: ConvTaskEvent }
   | { type: 'done'; tasksRun: string[] };
 
@@ -90,7 +92,10 @@ export class ConvOrchestrator {
     const tasksRun: string[] = [];
     for await (const event of this.streamTurn(userMessage, context)) {
       if (event.type === 'text') {
-        fullText += (fullText && !fullText.endsWith('\n') ? '\n' : '') + event.text;
+        // Skip segmentEnd-only events: they carry a TTS signal, not content.
+        if (!event.text) continue;
+        const separator = event.newSegment && fullText && !fullText.endsWith('\n') ? '\n' : '';
+        fullText += separator + event.text;
       } else if (event.type === 'task') {
         onTaskEvent?.(event.event);
       } else if (event.type === 'done') {
@@ -132,30 +137,115 @@ export class ConvOrchestrator {
     ];
 
     const tasksRun: string[] = [];
+    let hasVisibleText = false;
+    let acknowledgedWork = false;
     // Remember the user's verbatim message so we can attach it to every
     // delegate request - the task tier sees what the user actually said,
     // not the conv LLM's paraphrase.
     this.currentUserMessage = userMessage;
 
     for (let iteration = 0; iteration < MAX_CONV_ITERATIONS; iteration++) {
-      const response = await this.llm.chatTier('conversation', 'conv_orchestrator', messages, {
+      let responseText = '';
+      const responseToolCalls: LLMToolCall[] = [];
+      let response: LLMResponse | null = null;
+      let firstTextChunk = true;
+      // Visible text already yielded for this iteration, after serialized-tool
+      // removal. Successive strips of a growing buffer only ever extend this,
+      // so the delta is what's new.
+      let emittedVisible = '';
+
+      // Stream the conversation layer itself instead of waiting for a full
+      // chat response. Natural acknowledgments now reach the user as soon as
+      // the model writes them, before a delegated task begins.
+      for await (const event of this.llm.streamTier('conversation', 'conv_orchestrator', messages, {
         tools: CONV_TOOLS,
         tool_choice: 'auto',
-      });
+      })) {
+        if (event.type === 'text') {
+          responseText += event.text;
+          // Never expose a text-serialized tool call to the chat UI or TTS.
+          // Only the tail that could still become one is withheld — anywhere in
+          // the response, not just at the start — so ordinary prose keeps
+          // streaming at token latency.
+          const visible = visibleStreamText(responseText);
+          if (visible.length <= emittedVisible.length) continue;
+          const delta = visible.slice(emittedVisible.length);
+          emittedVisible = visible;
+          yield {
+            type: 'text',
+            text: delta,
+            newSegment: firstTextChunk && hasVisibleText,
+          };
+          firstTextChunk = false;
+          hasVisibleText = true;
+        } else if (event.type === 'tool_call') {
+          responseToolCalls.push(event.tool_call);
+        } else if (event.type === 'done') {
+          response = event.response;
+        } else if (event.type === 'error') {
+          throw Object.assign(new Error(event.error), { code: event.code });
+        }
+      }
+
+      response ??= {
+        content: responseText,
+        tool_calls: responseToolCalls,
+        usage: { input_tokens: 0, output_tokens: 0 },
+        model: 'unknown',
+        finish_reason: responseToolCalls.length > 0 ? 'tool_use' : 'stop',
+      };
+      response = {
+        ...response,
+        content: responseText || response.content || '',
+        tool_calls: responseToolCalls.length > 0 ? responseToolCalls : response.tool_calls,
+      };
+      const recovered = recoverSerializedConvTools(
+        response.content,
+        response.tool_calls ?? [],
+        `recovered_conv_${iteration}`,
+      );
+      response = { ...response, content: recovered.text, tool_calls: recovered.toolCalls };
+
+      // Flush anything the hold-back buffer was still holding when the stream
+      // ended — e.g. a trailing "/deleg" that never became a call, or content
+      // a provider only reports on its `done` event.
+      //
+      // `emittedVisible` is always a prefix of the recovered content (stripping
+      // a growing buffer only ever extends the visible text — see the
+      // monotonicity test in conv-tool-recovery.test.ts), so the tail is the
+      // part the user hasn't seen.
+      if (response.content.length > emittedVisible.length) {
+        yield {
+          type: 'text',
+          text: response.content.slice(emittedVisible.length),
+          newSegment: firstTextChunk && hasVisibleText,
+        };
+        emittedVisible = response.content;
+        firstTextChunk = false;
+        hasVisibleText = true;
+      }
 
       // Conv LLM emitted text only (no tool calls) -> final user-facing reply.
       if (!response.tool_calls || response.tool_calls.length === 0) {
-        if (response.content) yield { type: 'text', text: response.content };
         yield { type: 'done', tasksRun };
         return;
       }
 
-      // Conv LLM emitted tool calls. If it also wrote any prose (the
-      // acknowledgment - "I'm looking into that"), surface it NOW so the
-      // user gets immediate feedback before the slow task tier starts.
-      if (response.content && response.content.trim().length > 0) {
-        yield { type: 'text', text: response.content };
+      // Some tool-calling models return null content even when explicitly
+      // prompted to acknowledge the user. Supply one concise activity update
+      // so the delegated task never creates minutes of silent "thinking".
+      if (!response.content.trim() && !acknowledgedWork) {
+        const acknowledgment = progressAcknowledgement(response.tool_calls);
+        response.content = acknowledgment;
+        yield { type: 'text', text: acknowledgment, newSegment: hasVisibleText, segmentEnd: true };
+        hasVisibleText = true;
+      } else if (response.content.trim()) {
+        // The model wrote its own acknowledgment. Tell downstream TTS that it
+        // is complete so the sentence is spoken before the delegated task runs
+        // instead of waiting for the task's answer to arrive.
+        yield { type: 'text', text: '', segmentEnd: true };
       }
+      if (response.content.trim()) acknowledgedWork = true;
 
       messages.push({
         role: 'assistant',
@@ -192,6 +282,10 @@ export class ConvOrchestrator {
     yield {
       type: 'text',
       text: 'I got stuck routing your request. Could you rephrase or try again?',
+      // Separators are opt-in now, so this must be marked or it runs straight
+      // into whatever acknowledgment the loop already emitted.
+      newSegment: true,
+      segmentEnd: true,
     };
     yield { type: 'done', tasksRun };
   }

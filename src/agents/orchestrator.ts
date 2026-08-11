@@ -15,6 +15,7 @@ import type { AuditTrail } from '../authority/audit.ts';
 import type { DeferredExecutor } from '../authority/deferred-executor.ts';
 import type { EmergencyController } from '../authority/emergency.ts';
 import { getActionForTool } from '../authority/tool-action-map.ts';
+import { progressAcknowledgement } from './progress.ts';
 
 /**
  * Convert a system prompt (legacy string or static/dynamic parts) into the
@@ -559,6 +560,7 @@ export class AgentOrchestrator {
     const totalUsage = { input_tokens: 0, output_tokens: 0 };
     let finalText = '';
     let responseModel = 'unknown';
+    let acknowledgedWork = false;
 
     // Tool execution loop
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
@@ -625,6 +627,18 @@ export class AgentOrchestrator {
       }
 
       // Tool calls present — execute them
+      if (!accumulatedText.trim() && !acknowledgedWork) {
+        // Display-only activity narration for a model that called tools
+        // silently. It trails a blank line so the answer that follows doesn't
+        // run into it, and it stays out of `messages` — the model never said
+        // this, and attributing it back to the model would make the next turn
+        // reason from words it didn't write.
+        const narration = progressAcknowledgement(toolCalls) + '\n\n';
+        acknowledgedWork = true;
+        yield { type: 'text', text: narration, segmentEnd: true };
+        finalText += narration;
+      }
+      if (accumulatedText.trim()) acknowledgedWork = true;
       finalText += accumulatedText;
 
       // Add assistant message with tool calls to local messages
