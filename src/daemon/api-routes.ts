@@ -6,6 +6,7 @@
  */
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { DEBUG_RPC_HEADER, debugRpcGate, debugRpcTokenMatches } from './debug-rpc-gate.ts';
 import type { HealthMonitor } from './health.ts';
 import { applyApprovalDecision } from './approval-decision.ts';
 import { isPermissionName, readSystemPermissions, requestSystemPermission } from './system-permissions.ts';
@@ -4268,6 +4269,70 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           if (!ctx.sidecarManager) return error('Sidecar manager not available', 503);
           return json(ctx.sidecarManager.listSidecars());
         } catch (err) { return error(`${err}`); }
+      },
+    },
+
+    // Raw sidecar RPC passthrough for the control-plane bench harness
+    // (bench/control/acceptance.ts). It reaches any RPC a sidecar registered
+    // (shell, files, clipboard, browser JavaScript, desktop input) and skips
+    // routeToSidecar's capability checks, the authority engine and the audit
+    // trail; only the sidecar's own capability registry and command blocklist
+    // still apply. Hence the double gate: the route does not exist unless the
+    // daemon resolved a JARVIS_DEBUG_RPC secret of at least 16 characters at
+    // startup (never on a hosted install), and the caller must echo it back
+    // (compared in constant time). The HTTP server may be bound beyond
+    // loopback. See debug-rpc-gate.ts.
+    '/api/debug/rpc': {
+      POST: async (req: Request) => {
+        const gate = debugRpcGate();
+        if (!gate || !debugRpcTokenMatches(req.headers.get(DEBUG_RPC_HEADER), gate)) {
+          return error('Not found', 404);
+        }
+        try {
+          if (!ctx.sidecarManager) return error('Sidecar manager not available', 503);
+          const body = await req.json() as {
+            target?: string;
+            method?: string;
+            params?: Record<string, unknown>;
+          };
+
+          // The bench harness lists sidecars THROUGH this endpoint (which is
+          // reachable with just the debug secret) so it never needs the
+          // access-token-gated /api/sidecars.
+          if (body.method === '__list_sidecars') {
+            return json(ctx.sidecarManager.listSidecars().map((s) => ({
+              id: s.id, name: s.name, connected: s.connected, capabilities: s.capabilities,
+            })));
+          }
+
+          if (!body.method) return error('Missing "method" field');
+
+          const sidecars = ctx.sidecarManager.listSidecars();
+          const target = body.target
+            ? sidecars.find((s) => s.id === body.target || s.name.toLowerCase() === body.target!.toLowerCase())
+            : sidecars.find((s) => s.connected);
+          if (!target) return error(body.target ? `No sidecar matching "${body.target}"` : 'No connected sidecar', 409);
+          if (!target.connected) return error(`Sidecar "${target.name}" is offline`, 409);
+
+          // The only trace these calls leave: they never reach the audit trail.
+          console.log('[DebugRPC]', JSON.stringify(body.method), '->', target.name);
+          const started = Date.now();
+          const result = await ctx.sidecarManager.dispatchRPC(
+            target.id,
+            body.method,
+            body.params ?? {},
+            { initial: 60_000, max: 120_000 },
+          );
+          return json({
+            sidecar: target.name,
+            method: body.method,
+            elapsed_ms: Date.now() - started,
+            detached: result === 'detached',
+            result: result === 'detached' ? null : result,
+          });
+        } catch (err) {
+          return json({ error: err instanceof Error ? err.message : String(err) }, 500);
+        }
       },
     },
 
