@@ -129,25 +129,32 @@ function HostedBudgetStrip() {
   // Renders NOTHING while unknown and on a self-hosted install. An entitled
   // flag that is false means a hosted user with no active plan; there is no
   // window to meter, and a pair of empty bars would read as "all used up".
-  if (state !== "hosted" || !meter || !meter.entitled) return null;
+  // A RESTRICTED account renders even without a plan: its banner is the only
+  // place the person learns why nothing works and where to appeal.
+  if (state !== "hosted" || !meter || (!meter.entitled && !meter.restricted)) return null;
   const banner = bannerFor(meter);
   return (
     <div className="rk-usage__budget">
       {banner && <div className={`rk-usage__banner rk-usage__banner--${banner.tone}`}>{banner.text}</div>}
-      <div className="rk-usage__meters">
-        <Meter
-          label="6-hour window"
-          value={meter.sessionPct}
-          tone={meterTone(meter.sessionPct)}
-          note={formatResetIn(meter.sessionResetsAt, now)}
-        />
-        <Meter
-          label="this week"
-          value={meter.weekPct}
-          tone={meterTone(meter.weekPct)}
-          note={formatResetIn(meter.weekResetsAt, now)}
-        />
-      </div>
+      {/* Restricted with no plan: the windows would read 100% with a reset
+          countdown, which says the AI comes back at the reset. The banner is
+          the whole story, so the meters are left out. */}
+      {meter.entitled && (
+        <div className="rk-usage__meters">
+          <Meter
+            label="6-hour window"
+            value={meter.sessionPct}
+            tone={meterTone(meter.sessionPct)}
+            note={formatResetIn(meter.sessionResetsAt, now)}
+          />
+          <Meter
+            label="this week"
+            value={meter.weekPct}
+            tone={meterTone(meter.weekPct)}
+            note={formatResetIn(meter.weekResetsAt, now)}
+          />
+        </div>
+      )}
     </div>
   );
 }

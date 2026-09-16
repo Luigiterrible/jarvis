@@ -19,6 +19,7 @@ const meter = (over: Partial<HostedUsageMeter> = {}): HostedUsageMeter => ({
   weekPct: 10,
   sessionResetsAt: SESSION_RESET,
   weekResetsAt: WEEK_RESET,
+  restricted: null,
   ...over,
 });
 
@@ -144,6 +145,27 @@ describe('a key that is switched off', () => {
   test('repeats at most once per session window while it lasts', () => {
     const s = fakeStore([`${FLAG_PREFIX}blocked.${SESSION_RESET}`]);
     expect(decideUsageAlerts(meter({ blocked: true, sessionPct: 3 }), s.delivered)).toEqual([]);
+  });
+});
+
+describe('a restricted account', () => {
+  const restricted = { reason: 'account_suspended' as const, contact: 'support@usejarvis.test' };
+
+  test('is told once a week, with where to appeal, even with no plan left, and nothing else', () => {
+    const s = fakeStore([]);
+    const out = decideUsageAlerts(
+      meter({ entitled: false, blocked: true, sessionPct: 100, weekPct: 100, restricted }),
+      s.delivered,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]!.title).toContain('restricted');
+    expect(out[0]!.body).toContain('support@usejarvis.test');
+    expect(out[0]!.key).toBe(`${FLAG_PREFIX}restricted.account_suspended.${WEEK_RESET}`);
+  });
+
+  test('stays silent once this week\'s notice was delivered', () => {
+    const s = fakeStore([`${FLAG_PREFIX}restricted.account_suspended.${WEEK_RESET}`]);
+    expect(decideUsageAlerts(meter({ restricted }), s.delivered)).toEqual([]);
   });
 });
 

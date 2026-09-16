@@ -47,6 +47,27 @@ describe('UsejarvisAIProvider', () => {
     expect(auth ?? '').toBe('Bearer sk-uj-abc');
   });
 
+  it('tags chat requests with the origin they run under, and sends no header when it is unknown', async () => {
+    const { runWithOrigin } = await import('./origin.ts');
+    const seen: Array<string | null> = [];
+    globalThis.fetch = (async (_input: any, init?: any) => {
+      seen.push(new Headers(init?.headers).get('x-jarvis-origin'));
+      return jsonResponse(200, {
+        id: 'x',
+        object: 'chat.completion',
+        created: 0,
+        model: 'uj-chat',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      });
+    }) as unknown as typeof fetch;
+    const provider = new UsejarvisAIProvider('https://llm.usejarvis.host', 'sk-uj-abc');
+    await provider.chat([{ role: 'user', content: 'hi' }], { model: 'uj-chat' });
+    await runWithOrigin('background', () => provider.chat([{ role: 'user', content: 'hi' }], { model: 'uj-chat' }));
+    await runWithOrigin('workflow', () => provider.chat([{ role: 'user', content: 'hi' }], { model: 'uj-chat' }));
+    expect(seen).toEqual([null, 'background', 'workflow']);
+  });
+
   it('never sends a custom temperature — the uj-* aliases resolve to reasoning models that reject it', async () => {
     // The base OpenAIProvider skips temperature only for names it recognises as
     // reasoning models; the hosted aliases are opaque, so without the override a
@@ -230,6 +251,82 @@ describe('UsejarvisAIProvider', () => {
     const err = events.find((e) => e.type === 'error');
     expect(err?.error).toMatch(/included AI usage is used up/);
     expect(err?.error).toMatch(/\(400\)/);
+  });
+
+  it('a content-policy block is its own code in chat and stream, and never carries a retry hint', async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: { message: 'Guardrail blocked: usejarvis_content_policy' } }), {
+        status: 400,
+        // A hint the rewrite must DROP: a block is never retried.
+        headers: { 'Content-Type': 'application/json', 'Retry-After': '30' },
+      })) as unknown as typeof fetch;
+    const provider = new UsejarvisAIProvider('https://llm.usejarvis.host', 'sk-uj-abc');
+    const thrown = await provider.chat([{ role: 'user', content: 'hi' }], { model: 'uj-chat' }).catch((e) => e);
+    expect(thrown).toMatchObject({ name: 'LLMProviderError', code: 'content_policy' });
+    expect(thrown.retryAfterMs).toBeUndefined();
+    expect(thrown.message).toMatch(/\(400\).*blocked by the Usejarvis AI content policy/);
+
+    const events: Array<{ type: string; code?: string; retry_after_ms?: number }> = [];
+    for await (const ev of provider.stream([{ role: 'user', content: 'hi' }], { model: 'uj-chat' })) {
+      events.push(ev as { type: string; code?: string; retry_after_ms?: number });
+    }
+    const err = events.find((e) => e.type === 'error');
+    expect(err?.code).toBe('content_policy');
+    expect(err?.retry_after_ms).toBeUndefined();
+  });
+
+  it('a blocked key reads as restricted when the meter says so, and plain inactive otherwise', async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse(401, { error: { message: 'Authentication Error: key is blocked' } })) as unknown as typeof fetch;
+    const call = (provider: UsejarvisAIProvider) =>
+      provider.chat([{ role: 'user', content: 'hi' }], { model: 'uj-chat' }).catch((e) => e);
+
+    const restricted = await call(
+      new UsejarvisAIProvider('https://llm.usejarvis.host', 'sk-uj-abc', {
+        restriction: async () => ({ reason: 'content_policy', contact: 'support@usejarvis.test' }),
+      }),
+    );
+    expect(restricted).toMatchObject({ code: 'restricted' });
+    expect(restricted.message).toMatch(/restricted on this account.*support@usejarvis\.test/);
+
+    const inactive = await call(
+      new UsejarvisAIProvider('https://llm.usejarvis.host', 'sk-uj-abc', { restriction: async () => null }),
+    );
+    expect(inactive).toMatchObject({ code: 'auth' });
+    expect(inactive.message).toMatch(/active plan is required/);
+
+    // A meter that cannot be read never breaks the error path.
+    const unreadable = await call(
+      new UsejarvisAIProvider('https://llm.usejarvis.host', 'sk-uj-abc', {
+        restriction: async () => {
+          throw new Error('control plane down');
+        },
+      }),
+    );
+    expect(unreadable.message).toMatch(/active plan is required/);
+  });
+
+  it('budget exhaustion is quota_exhausted, while a plain 429 keeps the Retry-After it came with', async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: { message: 'ExceededBudget: budget has been exceeded' } }), {
+        status: 429,
+        // A hint the rewrite must drop: used-up usage is never retried.
+        headers: { 'Content-Type': 'application/json', 'Retry-After': '30' },
+      })) as unknown as typeof fetch;
+    const provider = new UsejarvisAIProvider('https://llm.usejarvis.host', 'sk-uj-abc');
+    const exhausted = await provider.chat([{ role: 'user', content: 'hi' }], { model: 'uj-chat' }).catch((e) => e);
+    expect(exhausted).toMatchObject({ code: 'quota_exhausted' });
+    expect(exhausted.retryAfterMs).toBeUndefined();
+
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: { message: 'rate limited' } }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json', 'Retry-After': '60' },
+      })) as unknown as typeof fetch;
+    await expect(provider.chat([{ role: 'user', content: 'hi' }], { model: 'uj-chat' })).rejects.toMatchObject({
+      code: 'rate_limit',
+      retryAfterMs: 60_000,
+    });
   });
 
   it('keeps retryable statuses recognizable (429 passes through with marker)', async () => {

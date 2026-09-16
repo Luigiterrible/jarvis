@@ -16,6 +16,7 @@ import type { PersonalityModel } from '../personality/model.ts';
 import { LLMManager } from '../llm/manager.ts';
 import { activeTurns, DrainingError } from './active-turns.ts';
 import { registerLLMProviders, configureLLMTiers } from '../llm/config-binding.ts';
+import { hostedRestrictionLookup } from './hosted-usage.ts';
 import { effectiveLlmForBinding } from './usejarvis-ai.ts';
 
 /** Wrap a turn's stream so the in-flight count is released when it settles
@@ -79,6 +80,7 @@ import { TaskDispatcher } from '../agents/conv/task-dispatcher.ts';
 import { DialogueCompactor } from '../agents/conv/dialogue-compactor.ts';
 import type { ConvTaskEvent } from '../agents/conv/conv-orchestrator.ts';
 import { getRecentConversation, getMessages } from '../vault/conversations.ts';
+import { runWithOrigin } from '../llm/origin.ts';
 
 export class AgentService implements Service, IAgentService {
   name = 'agent';
@@ -656,6 +658,7 @@ export class AgentService implements Service, IAgentService {
     const llm = effectiveLlmForBinding(this.config);
     const hasProvider = registerLLMProviders(this.llmManager, llm.providers ?? {}, {
       promptCache: llm.prompt_cache !== false,
+      hostedRestriction: hostedRestrictionLookup(this.config),
     });
 
     if (!hasProvider) {
@@ -1022,6 +1025,13 @@ export class AgentService implements Service, IAgentService {
   }
 
   private async extractKnowledge(userMessage: string, assistantResponse: string): Promise<void> {
+    // Follow-up work, not a new turn: it re-sends text the turn already sent,
+    // and tagging it as the person's own would count those words twice
+    // (src/llm/origin.ts).
+    return runWithOrigin('background', () => this.extractKnowledgeFromTurn(userMessage, assistantResponse));
+  }
+
+  private async extractKnowledgeFromTurn(userMessage: string, assistantResponse: string): Promise<void> {
     // The extractor uses the `low` tier internally - it's structured
     // extraction work that doesn't need the conversation model's smarts.
     await extractAndStore(userMessage, assistantResponse, this.llmManager);

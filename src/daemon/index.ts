@@ -87,6 +87,26 @@ import { DEFAULT_IDS } from "../workflows/db/schema.ts";
 import { apId } from "../workflows/db/ids.ts";
 import { buildSandboxServiceBackends } from "../workflows/runtime/service-backends.ts";
 import { EngineFlowExecutor } from "../workflows/runner/engine-runtime/engine-flow-executor.ts";
+import { createLimiter } from "../util/concurrency.ts";
+import { runWithOrigin } from "../llm/origin.ts";
+
+/** Sentences synthesized at once for one sidecar's Pebble speech (see runResponseCycle). */
+const PEBBLE_TTS_CONCURRENCY = 4;
+
+/**
+ * One synthesis limiter per sidecar, shared by every response cycle on it. A
+ * barge-in cancels a cycle whose in-flight syntheses cannot be stopped, and a
+ * limiter per cycle would let the next cycle start four more beside them.
+ */
+const pebbleSynthLimiters = new Map<string, ReturnType<typeof createLimiter>>();
+function pebbleSynthLimiter(sidecarId: string): ReturnType<typeof createLimiter> {
+  let limiter = pebbleSynthLimiters.get(sidecarId);
+  if (!limiter) {
+    limiter = createLimiter(PEBBLE_TTS_CONCURRENCY);
+    pebbleSynthLimiters.set(sidecarId, limiter);
+  }
+  return limiter;
+}
 
 // Constants
 const DEFAULT_PORT = 3142;  // JARVIS port
@@ -1354,7 +1374,10 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // the task via taskManager.setSummary so the dashboard panel route
       // can read it too. Re-dispatches set_expanded if the bubble is
       // still open by the time the summary lands.
-      const summarizeTaskAsync = async (taskId: string, sidecarId: string): Promise<void> => {
+      // Background: a digest of a finished task's output, not a new turn.
+      const summarizeTaskAsync = (taskId: string, sidecarId: string): Promise<void> =>
+        runWithOrigin('background', () => summarizeTaskOutput(taskId, sidecarId));
+      const summarizeTaskOutput = async (taskId: string, sidecarId: string): Promise<void> => {
         try {
           const tm = agentService.getTaskManager();
           const llm = agentService.getLLMManager();
@@ -2802,6 +2825,16 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           await speakConfirmation(sidecarId, "I can't start a background agent right now.", ctrl);
           return true;
         }
+        // Asked BEFORE spawning: a cap hit inside assign would leave an idle
+        // specialist behind for a task that never started.
+        if (!taskManagerLocal.canLaunch()) {
+          await speakConfirmation(
+            sidecarId,
+            "Too many background tasks are already running. Try again when one finishes.",
+            ctrl,
+          );
+          return true;
+        }
 
         const deps = {
           orchestrator,
@@ -3201,7 +3234,15 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // LLM's natural cadence. Sidecar's playback queue plays clips
       // back-to-back; we track estimated end-of-playback so we know
       // when to flip to idle.
-      const runResponseCycle = async (
+      // A Pebble reply is the person's own turn, including the streamed answer
+      // and the speech synthesized from it (src/llm/origin.ts).
+      const runResponseCycle = (
+        sidecarId: string,
+        userText: string,
+        ctrl: { cancelled: boolean },
+        opts?: { image?: { base64: string; mediaType: string } },
+      ): Promise<void> => runWithOrigin('user', () => runResponseCycleTurn(sidecarId, userText, ctrl, opts));
+      const runResponseCycleTurn = async (
         sidecarId: string,
         userText: string,
         ctrl: { cancelled: boolean },
@@ -3258,6 +3299,12 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         let lastPlaybackEnd = Date.now();
         let totalAudioMs = 0;
         const pendingTTS: Promise<unknown>[] = [];
+        // Synthesis started for every sentence at once, so a long reply fired a
+        // burst of parallel hosted TTS requests large enough to trip a per-key
+        // limit. Bounded per SIDECAR, shared with any cycle a barge-in starts;
+        // only the synthesize call holds a slot, so waiting on the previous
+        // clip below can never deadlock the queue.
+        const synthLimit = pebbleSynthLimiter(sidecarId);
         // Serializes clip DISPATCH (not synthesis) so sentences play in order
         // even when a later, shorter sentence synthesizes faster than an earlier
         // one. Each job awaits the previous before queueing its clip + bumping
@@ -3278,11 +3325,16 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           const job = (async () => {
             const ttsStart = Date.now();
             try {
-              const audio = await pebbleTTS!.synthesize(speakText);
+              const audio = await synthLimit(async () => {
+                // Checked once the slot is ours: a turn cancelled while this
+                // sentence queued must not pay for speech it will never play.
+                if (ctrl.cancelled) return null;
+                return pebbleTTS!.synthesize(speakText);
+              });
               // Synthesis may have finished out of order; wait for the previous
               // sentence's clip to be queued before queueing ours.
               await prev;
-              if (ctrl.cancelled) return;
+              if (ctrl.cancelled || !audio) return;
               const clipMs = estimateAudioDurationMs(audio) ?? sentence.length * 60;
               totalAudioMs += clipMs;
               const now = Date.now();
